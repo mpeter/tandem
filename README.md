@@ -85,10 +85,27 @@ reading the command catalog each turn. If the barrier fails, the turn is refused
 before input admission; an unknown slash command is sent literally only after
 the catalog settles.
 
-Retained OpenCode 1 sessions remain unsupported even after native migration
-completes: their converted history and sync cursors need verified reconciliation.
-Start a fresh pair to use OpenCode 2. Retained rows and existing pair membership
-stay intact.
+Retained OpenCode 1 pairs can be migrated explicitly with OpenCode **2.0.21**:
+
+```bash
+tandem migrate-opencode <pair-id> --dry-run  # source preflight; no native conversion
+tandem migrate-opencode <pair-id>
+```
+
+Migration uses native conversion, fork and import to create a fresh identity,
+verifies the imported history, then atomically translates every affected sync
+cursor and updates the pair. The original identity and legacy rows remain for
+recovery. Retries reuse the exact prepared identity; changed history, cursors or
+conflicting imports refuse adoption and preserve the unbound import.
+
+The initial scope is closed, nonempty root histories. Pending work, parent or
+revert state, extra instructions and unsupported attachments refuse migration.
+Completed checkpoints preserve native summary and recent context. Outgoing
+cursors must already have consumed archival context preceding the latest
+checkpoint; migration refuses otherwise, so superseded context cannot re-enter
+peers. Native compacted tool results retain the explicit cleared-result marker,
+while the original output remains in legacy storage. A dry run checks source
+shape only; native conversion and cursor cuts are verified during migration.
 
 ## What's new in 0.5
 

@@ -171,20 +171,23 @@ class Opencode2Runtime(OpencodeRuntime):
         self.harness_commands = [Command(c['name'], c.get('description', ''), 'opencode')
                                  for c in got['data']]
 
-    def _check_local_history(self, native_id):
+    def _check_local_history(self, native_id, session=None):
         if self._injected or not native_id:
             return
         from ...harness.opencode2 import database, db_path, require_fresh_session
+        from ...opencode_binding import validate_pair_prefix
 
         db = db_path()
         if db is None:
             raise RuntimeError('OpenCode 2 database is not discoverable; session history cannot be verified')
         with database(db) as conn:
             require_fresh_session(conn, native_id)
+            if session is not None:
+                validate_pair_prefix(conn, session)
 
     def list_models(self, session):
         if not self._injected:
-            self._check_local_history(session.native_id('opencode'))
+            self._check_local_history(session.native_id('opencode'), session)
         self.ensure_server(session.cwd, tandem_id=session.tandem_id)
         got = self._http('GET', '/api/model')
         return [f"{m['providerID']}/{m['id']}  {m.get('name', '')}".rstrip() for m in got['data']]
@@ -375,7 +378,7 @@ class Opencode2Runtime(OpencodeRuntime):
                 selected_model = {'providerID': provider, 'id': mid}
                 if marker:
                     selected_model['variant'] = variant
-            self._check_local_history(native_id)
+            self._check_local_history(native_id, session)
             self.ensure_server(session.cwd, tandem_id=session.tandem_id)
             if self._busy(native_id):
                 raise RuntimeError('opencode session is busy or has pending inbox input')

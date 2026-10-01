@@ -159,12 +159,17 @@ class Opencode2Runtime(OpencodeRuntime):
                 self._unregister(token)
 
     def _load_commands(self):
-        if self._commands_url == self.base_url:
-            return
+        # OpenCode 2.0.21's integration list awaits plugin activation; the
+        # command list itself can return an incomplete cold-start catalog.
+        try:
+            activated = self._http('GET', '/api/integration')
+            if not isinstance(activated, dict) or not isinstance(activated.get('data'), list):
+                raise ValueError('invalid activation barrier response')
+        except (OSError, ValueError, RuntimeError, http.client.HTTPException):
+            raise RuntimeError('opencode plugin activation barrier failed; command catalog is unavailable') from None
         got = self._http('GET', '/api/command')
         self.harness_commands = [Command(c['name'], c.get('description', ''), 'opencode')
                                  for c in got['data']]
-        self._commands_url = self.base_url
 
     def _check_local_history(self, native_id):
         if self._injected or not native_id:

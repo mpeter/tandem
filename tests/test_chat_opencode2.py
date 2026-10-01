@@ -46,6 +46,11 @@ class FakeServer:
         self.agent = 'build'
         self.admission_error = False
         self.environment_error = False
+        self.commands = [{'name': 'explain'}]
+        self.activated_commands = None
+        self.activation_error = None
+        self.activation_response = {'location': {'directory': '/tmp'}, 'data': []}
+        self.catalog_calls = []
         self.restore_delay = 0
         self.restore_settled = threading.Event()
         self.restore_reminder = None
@@ -89,8 +94,17 @@ class FakeServer:
                     self.send_json({'data': fake.active})
                 elif self.path.endswith('/inbox'):
                     self.send_json({'data': fake.pending})
+                elif self.path == '/api/integration':
+                    fake.catalog_calls.append(self.path)
+                    if fake.activation_error:
+                        self.send_json({'message': 'private integration payload'}, fake.activation_error)
+                        return
+                    if fake.activated_commands is not None:
+                        fake.commands = fake.activated_commands
+                    self.send_json(fake.activation_response)
                 elif self.path == '/api/command':
-                    self.send_json({'location': {'directory': '/tmp'}, 'data': [{'name': 'explain'}]})
+                    fake.catalog_calls.append(self.path)
+                    self.send_json({'location': {'directory': '/tmp'}, 'data': fake.commands})
                 elif self.path == '/api/model':
                     self.send_json({'location': {'directory': '/tmp'}, 'data': [
                         {'providerID': 'openai', 'id': 'gpt', 'name': 'GPT'}]})
@@ -193,6 +207,93 @@ def finish(worker, rt):
     worker.join(3)
     assert not worker.is_alive()
     rt.close()
+
+
+def test_cold_custom_command_waits_for_plugin_activation(fake):
+    fake.commands = []
+    fake.activated_commands = [{'name': 'late-custom'}]
+    rt = Opencode2Runtime(ChatConfig(), base_url=fake.base_url)
+    assert rt._http('GET', '/api/command')['data'] == []
+    rt.close()
+    fake.catalog_calls.clear()
+    rt, rec, result, worker = start_turn(fake, prompt='/late-custom ARG')
+    assert fake.catalog_calls == ['/api/integration', '/api/command']
+    assert fake.calls[-1] == (f'/api/session/{SID}/command', {'name': 'late-custom', 'text': 'ARG'})
+    fake.deliver()
+    fake.publish('session.execution.succeeded')
+    finish(worker, rt)
+    assert result[0].status == 'completed'
+
+
+def test_command_catalog_refreshes_for_later_turns(fake):
+    rt, rec, result, worker = start_turn(fake, prompt='/explain first')
+    fake.deliver()
+    fake.publish('session.execution.succeeded')
+    worker.join(3)
+    assert not worker.is_alive()
+    assert result[0].status == 'completed'
+    fake.calls.clear()
+    fake.posted.clear()
+    fake.commands = [{'name': 'new-custom'}]
+    worker = threading.Thread(target=lambda: result.append(
+        rt.run_turn(SESSION, SID, '/new-custom second', '', rec.emit, rec)))
+    worker.start()
+    assert fake.posted.wait(2)
+    assert fake.catalog_calls == ['/api/integration', '/api/command'] * 2
+    assert fake.calls[-1] == (f'/api/session/{SID}/command', {'name': 'new-custom', 'text': 'second'})
+    fake.deliver()
+    fake.publish('session.execution.succeeded')
+    finish(worker, rt)
+    assert result[1].status == 'completed'
+
+
+@pytest.mark.parametrize('commands', [[], [{'name': 'explain'}]])
+def test_unknown_slash_is_literal_after_settled_catalog(fake, commands):
+    fake.commands = commands
+    rt, rec, result, worker = start_turn(fake, prompt='/unknown ARG')
+    assert fake.catalog_calls == ['/api/integration', '/api/command']
+    path, body = fake.calls[-1]
+    assert path.endswith('/prompt')
+    assert body['text'] == '/unknown ARG'
+    fake.deliver()
+    fake.publish('session.execution.succeeded')
+    finish(worker, rt)
+    assert result[0].status == 'completed'
+
+
+@pytest.mark.parametrize('status', [401, 404, 500])
+def test_unavailable_activation_barrier_prevents_admission(fake, status):
+    fake.activation_error = status
+    rt = Opencode2Runtime(ChatConfig(mode='plan'), base_url=fake.base_url)
+    rec = Recorder()
+    try:
+        result = rt.run_turn(SESSION, SID, '/explain ARG', 'openai/gpt', rec.emit, rec)
+    finally:
+        rt.close()
+    assert result.status == 'failed'
+    assert 'activation barrier failed' in result.error
+    assert 'private integration payload' not in result.error
+    assert fake.catalog_calls == ['/api/integration']
+    assert fake.calls == []
+    assert fake.environments == []
+    assert not fake.posted.is_set()
+
+
+@pytest.mark.parametrize('response', [None, [], {}, {'data': 'private integration payload'}, {'data': {}}])
+def test_invalid_activation_barrier_response_prevents_admission(fake, response):
+    fake.activation_response = response
+    rt = Opencode2Runtime(ChatConfig(mode='plan'), base_url=fake.base_url)
+    rec = Recorder()
+    try:
+        result = rt.run_turn(SESSION, SID, '/explain ARG', 'openai/gpt', rec.emit, rec)
+    finally:
+        rt.close()
+    assert result.status == 'failed'
+    assert 'activation barrier failed' in result.error
+    assert 'private integration payload' not in result.error
+    assert fake.catalog_calls == ['/api/integration']
+    assert fake.calls == []
+    assert fake.environments == []
 
 
 def test_admission_is_not_completion_and_unrelated_terminal_is_ignored(fake):

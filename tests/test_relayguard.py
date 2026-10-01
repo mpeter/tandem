@@ -370,14 +370,15 @@ def test_handback_update_preserves_every_worker_footer_and_whitespace(tmp_path):
     assert relayguard.decision(value, "pre")["hookSpecificOutput"]["updatedInput"]["message"] == output
 
 
-def test_corrected_handback_hook_evidence_allows_modern_stop(tmp_path):
+@pytest.mark.parametrize("hook_command", ["tandem hook-relay pre", relayguard.PRE_HOOK_COMMAND])
+def test_corrected_handback_hook_evidence_allows_modern_stop(tmp_path, hook_command):
     value = transcript(tmp_path)
     output = value["last_assistant_message"]
     entries = [
         {"type": "assistant", "message": {"content": [{"type": "tool_use", "id": "corrected-handback", "name": "SubagentHandback", "input": {"message": "Incomplete copy"}}]}},
         {"type": "attachment", "attachment": {
             "type": "hook_success", "hookName": "PreToolUse:SubagentHandback",
-            "command": "tandem hook-relay pre", "toolUseID": "corrected-handback",
+            "command": hook_command, "toolUseID": "corrected-handback",
             "stdout": json.dumps({"hookSpecificOutput": {"hookEventName": "PreToolUse", "updatedInput": {"message": output}}}),
         }},
         {"type": "user", "message": {"content": [{"type": "tool_result", "tool_use_id": "corrected-handback", "content": "Delivered", "is_error": False}]}},
@@ -386,3 +387,46 @@ def test_corrected_handback_hook_evidence_allows_modern_stop(tmp_path):
         stream.write("\n".join(map(json.dumps, entries)) + "\n")
     value["last_assistant_message"] = "Done."
     assert relayguard.decision(value, "stop") is None
+
+
+def test_foreign_hook_command_cannot_certify_corrected_handback(tmp_path):
+    value = transcript(tmp_path)
+    output = value["last_assistant_message"]
+    entries = [
+        {"type": "assistant", "message": {"content": [{"type": "tool_use", "id": "handback", "name": "SubagentHandback", "input": {"message": "Incomplete copy"}}]}},
+        {"type": "attachment", "attachment": {
+            "type": "hook_success", "hookName": "PreToolUse:SubagentHandback",
+            "command": "foreign " + relayguard.PRE_HOOK_COMMAND, "toolUseID": "handback",
+            "stdout": json.dumps({"hookSpecificOutput": {"updatedInput": {"message": output}}}),
+        }},
+        {"type": "user", "message": {"content": [{"type": "tool_result", "tool_use_id": "handback", "content": "Delivered"}]}},
+    ]
+    with (tmp_path / "agent.jsonl").open("a") as stream:
+        stream.write("\n".join(map(json.dumps, entries)) + "\n")
+    value["last_assistant_message"] = "Done."
+    assert relayguard.decision(value, "stop")["decision"] == "block"
+
+
+def test_native_turn_companion_preserves_delivered_handback(tmp_path):
+    value = transcript(tmp_path)
+    output = value["last_assistant_message"]
+    entries = [
+        {"type": "assistant", "message": {"content": [{"type": "tool_use", "id": "handback", "name": "SubagentHandback", "input": {"message": output}}]}},
+        {"type": "user", "message": {"content": [{"type": "tool_result", "tool_use_id": "handback", "content": [{"type": "text", "text": '{"success":true,"message":"Report delivered to your caller."}'}]}]}},
+        {"type": "user", "isMeta": True, "turnCompanion": True, "message": {"content": "[Your previous response had no visible output. Please continue and produce a user-visible response.]"}},
+    ]
+    with (tmp_path / "agent.jsonl").open("a") as stream:
+        stream.write("\n".join(map(json.dumps, entries)) + "\n")
+    value["last_assistant_message"] = "Done."
+    assert relayguard.assigned_task(value) == "review this"
+    assert relayguard.decision(value, "stop") is None
+
+
+@pytest.mark.parametrize("metadata", [{}, {"isMeta": True}, {"turnCompanion": True}])
+def test_real_followup_after_handback_remains_new_assignment(tmp_path, metadata):
+    value = transcript(tmp_path)
+    text = "Review the new task instead."
+    with (tmp_path / "agent.jsonl").open("a") as stream:
+        stream.write(json.dumps({"type": "user", **metadata, "message": {"content": text}}) + "\n")
+    assert relayguard.assigned_task(value) == text
+    assert relayguard.decision(value, "stop")["decision"] == "block"

@@ -15,7 +15,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "tandem hook-relay pre"
+            "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/hooks/relay-scope.py\" pre || exit 2"
           }
         ]
       }
@@ -26,7 +26,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "tandem hook-relay stop"
+            "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/hooks/relay-scope.py\" stop || exit 2"
           }
         ]
       }
@@ -37,7 +37,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "tandem hook-relay post"
+            "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/hooks/relay-scope.py\" post || exit 2"
           }
         ]
       }

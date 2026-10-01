@@ -90,7 +90,10 @@ the worker id, model, exit code and task digest. `SubagentHandback` and
 `SubagentStop` require a matching dispatch/result pair in the relay's own
 transcript. Before handback executes, its input message is replaced with
 the verified worker stdout, including every receipt and model footer;
-the relay does not have to reconstruct the text. A dispatch that failed
+the relay does not have to reconstruct the text. Claude provides native
+handback to local, non-fork subagents in auto mode on CLI 2.1.271 or later.
+Other modes use exact final-text verification; a relay that changes whitespace
+is blocked rather than accepted as a verbatim response. A dispatch that failed
 returns the same error output with the
 `[tandem-sub failed]` prefix; a relay that never invoked Codex cannot pass.
 The parent dispatch hook labels asynchronous results pending and reports
@@ -98,7 +101,13 @@ unverified completed handbacks as unverified rather than treating them as
 Codex work. Other agents are unaffected.
 
 These hooks live in `hooks/hooks.json`: Claude ignores `hooks` in plugin
-agent frontmatter. Keep the installed CLI and plugin versions together, and
+agent frontmatter. A bundled scope helper parses the native hook's top-level
+agent identity before invoking Tandem, so an older CLI cannot block ordinary
+tools. Relay dispatches and completion remain blocked, or labeled unverified,
+when the matching CLI is missing or fails. The helper requires `python3` on
+PATH; if its interpreter or script cannot run, the hook exits 2 rather than
+silently allowing a relay. This failure can also block ordinary tools until
+the helper is restored. Keep the installed CLI and plugin versions together, and
 verify the hooks in a fresh invocation before relying on enforcement.
 [Claude subagent reference](https://code.claude.com/docs/en/sub-agents#supported-frontmatter-fields),
 [hook reference](https://code.claude.com/docs/en/hooks#subagentstop).

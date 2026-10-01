@@ -16,6 +16,7 @@ _COMMAND = re.compile(
     r"(TANDEM_TASK_EOF(?:_[0-9]+)?)'\n"
 )
 _RECEIPT = "[tandem-sub receipt] "
+PRE_HOOK_COMMAND = 'python3 "${CLAUDE_PLUGIN_ROOT}/hooks/relay-scope.py" pre || exit 2'
 _RETRY = "Relay only: run tandem sub -q with the entire brief in a single quoted heredoc."
 
 
@@ -87,7 +88,10 @@ def _receipt_code(output: str, brief: str) -> int | None:
     return None
 
 
-def _task_text(content: object) -> str | None:
+def _task_text(entry: dict) -> str | None:
+    if entry.get("isMeta") is True and entry.get("turnCompanion") is True:
+        return None
+    content = entry.get("message", {}).get("content")
     if isinstance(content, list) and any(
         isinstance(block, dict) and block.get("type") == "tool_result"
         for block in content
@@ -130,7 +134,7 @@ def assigned_task(payload: dict) -> str | None:
             for line in stream:
                 entry = json.loads(line)
                 if entry.get("type") == "user":
-                    text = _task_text(entry.get("message", {}).get("content"))
+                    text = _task_text(entry)
                     if text is not None and not _retry_control(text):
                         task = text
     except (OSError, ValueError, TypeError, AttributeError):
@@ -166,7 +170,7 @@ def _worker_output(payload: dict) -> tuple[str | None, bool, str | None]:
                 if (entry.get("type") == "attachment" and isinstance(attachment, dict)
                         and attachment.get("type") == "hook_success"
                         and attachment.get("hookName") == "PreToolUse:SubagentHandback"
-                        and attachment.get("command") == "tandem hook-relay pre"
+                        and attachment.get("command") in ("tandem hook-relay pre", PRE_HOOK_COMMAND)
                         and completed and not calls):
                     code, failed, output = completed[-1]
                     hook_output = json.loads(attachment.get("stdout", "{}"))
@@ -182,7 +186,7 @@ def _worker_output(payload: dict) -> tuple[str | None, bool, str | None]:
                     continue
                 blocks = message.get("content")
                 if entry.get("type") == "user":
-                    text = _task_text(blocks)
+                    text = _task_text(entry)
                     if text is not None:
                         if not _retry_control(text):
                             task = text

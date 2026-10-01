@@ -169,11 +169,14 @@ def test_loop_guard_covers_both_relay_agents():
 
 
 def test_plugin_hooks_enforce_relay_tool_and_handback_contract():
+    from tandem.relayguard import PRE_HOOK_COMMAND
+
     hooks = json.loads((PLUGIN / "hooks" / "hooks.json").read_text())["hooks"]
     assert hooks["PreToolUse"][1]["matcher"] == "*"
-    assert hooks["PreToolUse"][1]["hooks"][0]["command"] == "tandem hook-relay pre"
+    assert hooks["PreToolUse"][1]["hooks"][0]["command"] == PRE_HOOK_COMMAND
     assert hooks["SubagentStop"][0]["matcher"] == "^tandem:(gpt|codex-worker)$"
-    assert hooks["SubagentStop"][0]["hooks"][0]["command"] == "tandem hook-relay stop"
+    assert hooks["SubagentStop"][0]["hooks"][0]["command"] == PRE_HOOK_COMMAND.replace(" pre ", " stop ")
+    assert hooks["PostToolUse"][0]["hooks"][0]["command"] == PRE_HOOK_COMMAND.replace(" pre ", " post ")
     for name in ("gpt", "codex-worker"):
         front = (PLUGIN / "agents" / f"{name}.md").read_text().split("---")[1]
         assert re.search(r"^maxTurns:\s*6\s*$", front, re.M)

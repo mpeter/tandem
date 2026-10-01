@@ -45,6 +45,8 @@ def mini_db(tmp_path, monkeypatch):
     conn.commit()
     conn.close()
     monkeypatch.setenv("OPENCODE_DB", str(db))
+    monkeypatch.setattr(opencode.compat, "detect_cli_version",
+                        lambda binary: "opencode v1.18.20")
     opencode._reset_db_cache()
     return db
 
@@ -72,6 +74,14 @@ def test_db_path_env_override(mini_db):
     assert opencode.db_path() == mini_db
 
 
+def test_db_path_rejects_future_opencode_before_using_override(tmp_path, monkeypatch):
+    monkeypatch.setenv("OPENCODE_DB", str(tmp_path / "opencode.db"))
+    monkeypatch.setattr(opencode.compat, "detect_cli_version",
+                        lambda binary: "opencode v3.0.0")
+
+    assert opencode.db_path() is None
+
+
 def test_db_path_none_when_undiscoverable(monkeypatch):
     monkeypatch.delenv("OPENCODE_DB", raising=False)
     opencode._reset_db_cache()
@@ -89,9 +99,25 @@ def test_runtime_ready_fails_closed_without_tables(tmp_path, monkeypatch):
     db = tmp_path / "empty.db"
     sqlite3.connect(db).close()
     monkeypatch.setenv("OPENCODE_DB", str(db))
+    monkeypatch.setattr(opencode.compat, "detect_cli_version",
+                        lambda binary: "opencode v1.18.20")
     opencode._reset_db_cache()
     ok, reason = opencode.OpencodeAdapter().runtime_ready()
     assert not ok and "table" in reason
+
+
+def test_runtime_ready_rejects_future_opencode_before_database_probe(monkeypatch):
+    monkeypatch.setattr(opencode.compat, "detect_cli_version",
+                        lambda binary: "opencode v3.0.0")
+    monkeypatch.setattr(
+        opencode, "db_path",
+        lambda: pytest.fail("OpenCode 3 must be rejected before database lookup"),
+    )
+
+    ok, reason = opencode.OpencodeAdapter().runtime_ready()
+
+    assert not ok
+    assert "OpenCode 3 is unsupported" in reason
 
 
 def test_registered_in_adapters():
@@ -490,6 +516,8 @@ def test_runtime_ready_rejects_non_wal(tmp_path, monkeypatch):
     conn.commit()
     conn.close()
     monkeypatch.setenv("OPENCODE_DB", str(db))
+    monkeypatch.setattr(opencode.compat, "detect_cli_version",
+                        lambda binary: "opencode v1.18.20")
     opencode._reset_db_cache()
     ok, reason = opencode.OpencodeAdapter().runtime_ready()
     assert not ok and "journal_mode" in reason

@@ -50,9 +50,11 @@ def test_uuid7_is_valid_and_ordered():
     assert ua.bytes[:6] <= ub.bytes[:6]  # time-ordered prefix
 
 
-def test_opencode_compat_floor_only():
+def test_opencode_v1_range_rejects_the_incompatible_v2_major():
     assert compat.version_supported("opencode", "1.18.15")
-    assert compat.version_supported("opencode", "9.9.9")      # no ceiling
+    assert compat.version_supported("opencode", "1.99.99")
+    assert not compat.version_supported("opencode", "2.0.0")
+    assert not compat.version_supported("opencode", "9.9.9")
     assert not compat.version_supported("opencode", "1.17.0")  # below floor
 
 

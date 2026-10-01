@@ -11,4 +11,13 @@ ADAPTERS: dict[str, HarnessAdapter] = {
 
 
 def get_adapter(harness_id: str) -> HarnessAdapter:
-    return ADAPTERS[harness_id]
+    adapter = ADAPTERS[harness_id]
+    if harness_id == "opencode" and type(adapter) is OpencodeAdapter:
+        from .. import compat
+
+        version = compat.parse_version(adapter.detect_version() or "")
+        if version and version[0] == 2:
+            from .opencode2 import Opencode2Adapter
+
+            return Opencode2Adapter()
+    return adapter

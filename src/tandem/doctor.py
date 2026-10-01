@@ -83,11 +83,15 @@ def run_doctor(store, session, live: bool = False) -> DoctorReport:
             # not-installed is a normal state, not a degraded one)
             report.ok(f"{adapter.display_name}: not installed (not a participant)")
         elif not adapter.version_supported(v):
-            report.warn(
-                f"{adapter.display_name}: version {v!r} outside supported range "
-                f"(tested against {compat.COMPAT[hid].tested}); session formats "
-                f"may have drifted — treat sync results with suspicion"
-            )
+            reason = compat.hard_rejection_reason(hid, v)
+            if reason:
+                report.warn(f"{adapter.display_name}: {v} — {reason}; excluded from new pairs")
+            else:
+                report.warn(
+                    f"{adapter.display_name}: version {v!r} outside supported range "
+                    f"(tested against {compat.COMPAT[hid].tested}); session formats "
+                    f"may have drifted — treat sync results with suspicion"
+                )
         else:
             report.ok(f"{adapter.display_name}: {v}")
             ok, reason = adapter.runtime_ready()

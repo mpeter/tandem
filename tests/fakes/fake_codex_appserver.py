@@ -57,7 +57,7 @@ def thread_result(thread_id, params):
     # Mimic an administrator's workspace default taking precedence over a
     # legacy sandbox override. Named profile selection must avoid that trap.
     profile = params.get("permissions", ":workspace")
-    sandbox = profiles[profile]
+    sandbox = os.environ.get("FAKE_EFFECTIVE_SANDBOX", profiles[profile])
     if os.environ.get("FAKE_POLICY_MISMATCH") == "sandbox":
         sandbox = "workspaceWrite"
     result = {"thread": {"id": thread_id, "cwd": params.get("cwd"), "turns": []},
@@ -67,6 +67,8 @@ def thread_result(thread_id, params):
         result["activePermissionProfile"] = {"id": ":workspace"}
     if os.environ.get("FAKE_POLICY_MISMATCH") == "approval":
         result["approvalPolicy"] = "untrusted"
+    if os.environ.get("FAKE_POLICY_MISMATCH") == "sandbox-missing":
+        result.pop("sandbox")
     if os.environ.get("FAKE_POLICY_MISMATCH") == "missing":
         return {"thread": result["thread"], "model": "gpt-fake"}
     return result
@@ -100,7 +102,7 @@ def main():
         elif meth == "initialized":
             pass
         elif meth == "config/read":
-            out({"jsonrpc": "2.0", "id": rid, "result": {"config": {
+            out({"jsonrpc": "2.0", "id": rid, "result": {"config": json.loads(os.environ["FAKE_DEFAULT_CONFIG"]) if os.environ.get("FAKE_DEFAULT_CONFIG") else {
                 "approval_policy": "on-request", "sandbox_mode": "workspace-write", "default_permissions": None}}})
         elif meth == "permissionProfile/list":
             if os.environ.get("FAKE_PROFILES_UNSUPPORTED"):

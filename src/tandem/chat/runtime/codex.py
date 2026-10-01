@@ -100,7 +100,7 @@ def _user_text(rec: dict) -> str | None:
     return None
 
 
-def _turns(path: Path) -> list[tuple[str, str, str | None, bool]]:
+def _turns(path: Path) -> list[tuple[str | None, str | None, str | None, bool]]:
     """`(approval_policy, sandbox type, profile id, is_review)` of every turn_context
     record in a rollout, in file order. Only codex writes turn_context, one
     per turn it ran; a turn is a review when a user record after it (before
@@ -110,7 +110,7 @@ def _turns(path: Path) -> list[tuple[str, str, str | None, bool]]:
     `task_started` since the previous one is a mid-turn compaction
     continuation and keeps the previous turn's review mark. Unparsable lines
     are skipped; an unreadable file has none."""
-    found: list[tuple[str, str, str | None, bool]] = []
+    found: list[tuple[str | None, str | None, str | None, bool]] = []
     started = False
     try:
         with open(path, encoding="utf-8", errors="replace") as f:
@@ -139,9 +139,14 @@ def _turns(path: Path) -> list[tuple[str, str, str | None, bool]]:
                     active = payload.get("active_permission_profile")
                     profile = active.get("id") if isinstance(active, dict) else None
                     profile = profile if isinstance(profile, str) and profile else None
-                    if isinstance(approval, str) and isinstance(sandbox, str):
+                    if active is not None and profile is None:
+                        raise RuntimeError("codex cannot restore malformed recorded permission profile")
+                    if "active_permission_profile" in payload and profile is None and not isinstance(sandbox, str):
+                        raise RuntimeError("codex cannot restore malformed recorded permission profile")
+                    if (isinstance(approval, str) and isinstance(sandbox, str)) or profile is not None:
                         # a continuation (no task_started) is the same turn
-                        found.append((approval, sandbox, profile,
+                        found.append((approval if isinstance(approval, str) else None,
+                                      sandbox if isinstance(sandbox, str) else None, profile,
                                       False if started or not found else found[-1][3]))
                         started = False
                     continue
@@ -186,21 +191,26 @@ def policy_after_review(path: Path | None, *, default_policy: Callable[[], dict]
     Named profile provenance is preserved when the rollout records it. The
     runtime supplies the server's effective configuration for the fallback;
     standalone callers use the local user config. A recorded policy the
-    protocol does not know is treated as absent:
-    sending it would fail thread/resume, and with no new turn_context, every
-    turn after it."""
+    protocol does not know is treated as absent when it has no named profile.
+    Malformed named-profile provenance and unsupported named approval policies
+    are refused rather than replaced with a different default."""
     if path is None:
         return None
     turns = _turns(path)
     if not turns or not turns[-1][3]:
         return None
     for approval, sandbox, profile, is_review in reversed(turns):
-        if is_review or approval not in _APPROVAL_POLICIES or sandbox not in _SANDBOX_MODES:
+        if is_review:
             continue
-        restored = {"approvalPolicy": approval, "sandbox": sandbox}
         if profile is not None:
-            restored["permissions"] = profile
-        return restored
+            if approval not in _APPROVAL_POLICIES:
+                raise RuntimeError("codex cannot restore the recorded approval policy")
+            restored = {"approvalPolicy": approval, "permissions": profile}
+            if sandbox in _SANDBOX_MODES:
+                restored["sandbox"] = sandbox
+            return restored
+        if approval in _APPROVAL_POLICIES and sandbox in _SANDBOX_MODES:
+            return {"approvalPolicy": approval, "sandbox": sandbox}
     return default_policy() if default_policy is not None else codex_default_policy()
 
 
@@ -673,11 +683,15 @@ class CodexRuntime:
             raise RuntimeError("codex cannot restore its default policy: " + str(r["error"].get("message", r["error"])))
         conf = (r.get("result") or {}).get("config") or {}
         approval, sandbox = conf.get("approval_policy"), conf.get("sandbox_mode")
-        if approval not in _APPROVAL_POLICIES or sandbox not in _SANDBOX_MODES:
-            raise RuntimeError("codex did not report a supported default policy")
-        policy = {"approvalPolicy": approval, "sandbox": sandbox}
         profile = conf.get("default_permissions")
-        if isinstance(profile, str) and profile:
+        named = isinstance(profile, str) and bool(profile)
+        if approval not in _APPROVAL_POLICIES or (sandbox not in _SANDBOX_MODES
+                                                  and not (sandbox is None and named)):
+            raise RuntimeError("codex did not report a supported default policy")
+        policy = {"approvalPolicy": approval}
+        if sandbox is not None:
+            policy["sandbox"] = sandbox
+        if named:
             policy["permissions"] = profile
         return policy
 
@@ -692,10 +706,14 @@ class CodexRuntime:
             active = result.get("activePermissionProfile") or {}
             effective = result.get("sandbox") or {}
             if not isinstance(active, dict) or not isinstance(effective, dict) \
-                    or sandbox is None \
                     or active.get("id") != profile \
-                    or effective.get("type") != _EFFECTIVE_SANDBOX_TYPES.get(sandbox):
+                    or not isinstance(effective.get("type"), str):
                 return f"codex did not apply permission profile {profile} ({sandbox})"
+            if profile in _PERMISSION_PROFILES.values():
+                expected = next(_EFFECTIVE_SANDBOX_TYPES[mode] for mode, name
+                                in _PERMISSION_PROFILES.items() if name == profile)
+                if effective.get("type") != expected:
+                    return f"codex did not apply permission profile {profile} ({sandbox})"
         return None
 
     def list_models(self, session) -> list[str]:
@@ -780,10 +798,10 @@ class CodexRuntime:
                         continue
                     overrides.setdefault(k, v)
             sandbox = overrides.pop("sandbox", None)
-            if sandbox is not None:
-                profile = overrides.get("permissions") or _PERMISSION_PROFILES.get(sandbox)
-                if profile is None:
-                    return fail(f"unsupported codex sandbox mode: {sandbox}")
+            profile = overrides.get("permissions") or _PERMISSION_PROFILES.get(sandbox)
+            if sandbox is not None and profile is None:
+                return fail(f"unsupported codex sandbox mode: {sandbox}")
+            if profile is not None:
                 error = self._profile_allowed(proc, q, profile, emit, answers)
                 if error:
                     return fail(error)

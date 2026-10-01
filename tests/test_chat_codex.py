@@ -1039,3 +1039,129 @@ def test_review_restoration_preserves_named_profile_and_explicit_override(env):
     rt = CodexRuntime(ChatConfig(mode="plan"), binary=[sys.executable, str(FAKE)])
     assert rt.run_turn(env.session, "thread-1", "go", "", rec.emit, rec).status == "completed"
     assert env.params("thread/resume")["permissions"] == ":read-only"
+
+
+@pytest.fixture
+def profile_only_review(env, monkeypatch):
+    rollout = env.tmp / '.codex' / 'sessions' / '2026' / 'rollout-2026-09-27T00-00-00-thread-1.jsonl'
+    rollout.parent.mkdir(parents=True)
+    write_rollout(rollout, [('never', 'read-only', REVIEW)])
+    monkeypatch.setenv('FAKE_DEFAULT_CONFIG', json.dumps({
+        'approval_policy': 'on-request', 'sandbox_mode': None,
+        'default_permissions': 'restricted-project'}))
+    return env
+
+
+def test_first_review_restores_profile_only_default(profile_only_review):
+    env = profile_only_review
+    rec = Recorder()
+    out = env.runtime.run_turn(env.session, 'thread-1', 'go', '', rec.emit, rec)
+    assert out.status == 'completed'
+    assert env.params('permissionProfile/list') == {}
+    assert env.params('thread/resume') == {
+        'threadId': 'thread-1', 'cwd': env.session.cwd,
+        'approvalPolicy': 'on-request', 'permissions': 'restricted-project'}
+
+
+@pytest.mark.parametrize('setting,value', [
+    ('FAKE_PROFILE_DENIED', 'restricted-project'),
+    ('FAKE_PROFILE_MISSING', 'restricted-project'),
+    ('FAKE_PROFILES_UNSUPPORTED', '1'),
+])
+def test_profile_only_default_is_validated_before_resume(profile_only_review, monkeypatch, setting, value):
+    env = profile_only_review
+    monkeypatch.setenv(setting, value)
+    rec = Recorder()
+    out = env.runtime.run_turn(env.session, 'thread-1', 'go', '', rec.emit, rec)
+    assert out.status == 'failed'
+    assert env.params('permissionProfile/list') == {}
+    assert env.params('thread/resume') is None
+    assert env.params('turn/start') is None
+
+
+@pytest.mark.parametrize('mismatch', ['profile', 'approval', 'missing', 'sandbox-missing'])
+def test_profile_only_default_requires_effective_readback(profile_only_review, monkeypatch, mismatch):
+    env = profile_only_review
+    monkeypatch.setenv('FAKE_POLICY_MISMATCH', mismatch)
+    rec = Recorder()
+    out = env.runtime.run_turn(env.session, 'thread-1', 'go', '', rec.emit, rec)
+    assert out.status == 'failed' and 'did not apply' in out.error
+    assert env.params('thread/resume')['permissions'] == 'restricted-project'
+    assert env.params('turn/start') is None
+
+
+def test_custom_profile_readback_does_not_guess_coarse_sandbox(profile_only_review, monkeypatch):
+    env = profile_only_review
+    monkeypatch.setenv('FAKE_EFFECTIVE_SANDBOX', 'externalSandbox')
+    rec = Recorder()
+    out = env.runtime.run_turn(env.session, 'thread-1', 'go', '', rec.emit, rec)
+    assert out.status == 'completed'
+    assert env.params('thread/resume')['permissions'] == 'restricted-project'
+
+
+@pytest.mark.parametrize('sandbox,profile,approval', [
+    (None, None, 'on-request'),
+    ('unsupported', 'restricted-project', 'on-request'),
+    (None, '', 'on-request'),
+    (None, 'restricted-project', 'unsupported'),
+])
+def test_unresolved_default_fails_before_resume(profile_only_review, monkeypatch, sandbox, profile, approval):
+    env = profile_only_review
+    monkeypatch.setenv('FAKE_DEFAULT_CONFIG', json.dumps({
+        'approval_policy': approval, 'sandbox_mode': sandbox, 'default_permissions': profile}))
+    rec = Recorder()
+    out = env.runtime.run_turn(env.session, 'thread-1', 'go', '', rec.emit, rec)
+    assert out.status == 'failed' and 'supported default policy' in out.error
+    assert env.params('thread/resume') is None
+    assert env.params('turn/start') is None
+
+
+def test_explicit_mode_overrides_profile_only_restoration(profile_only_review):
+    env = profile_only_review
+    rec = Recorder()
+    rt = CodexRuntime(ChatConfig(mode='plan'), binary=[sys.executable, str(FAKE)])
+    out = rt.run_turn(env.session, 'thread-1', 'go', '', rec.emit, rec)
+    assert out.status == 'completed'
+    assert env.params('thread/resume')['permissions'] == ':read-only'
+
+
+@pytest.mark.parametrize('sandbox', ['external-sandbox', None])
+def test_review_restoration_preserves_custom_profile_without_legacy_sandbox(tmp_path, sandbox):
+    rollout = tmp_path / 'rollout.jsonl'
+    write_rollout(rollout, [('on-request', 'workspace-write', 'ordinary'), ('never', 'read-only', REVIEW)])
+    records = [json.loads(line) for line in rollout.read_text().splitlines()]
+    for record in records:
+        if record['type'] == 'turn_context' and record['payload']['approval_policy'] == 'on-request':
+            record['payload']['sandbox_policy'] = {'type': sandbox} if sandbox else None
+            record['payload']['active_permission_profile'] = {'id': 'restricted-project'}
+    rollout.write_text('\n'.join(json.dumps(r) for r in records) + '\n')
+    assert codex_mod.policy_after_review(rollout) == {'approvalPolicy': 'on-request', 'permissions': 'restricted-project'}
+
+
+@pytest.mark.parametrize('approval', ['unsupported', None, {'granular': True}])
+def test_recorded_custom_profile_with_unsupported_approval_fails(tmp_path, approval):
+    rollout = tmp_path / 'rollout.jsonl'
+    write_rollout(rollout, [('on-request', 'workspace-write', 'ordinary'), ('never', 'read-only', REVIEW)])
+    records = [json.loads(line) for line in rollout.read_text().splitlines()]
+    for record in records:
+        if record['type'] == 'turn_context' and record['payload']['approval_policy'] == 'on-request':
+            record['payload']['approval_policy'] = approval
+            record['payload']['active_permission_profile'] = {'id': 'restricted-project'}
+    rollout.write_text('\n'.join(json.dumps(r) for r in records) + '\n')
+    with pytest.raises(RuntimeError, match='recorded approval policy'):
+        codex_mod.policy_after_review(rollout)
+
+
+@pytest.mark.parametrize('profile', [{'id': None}, {'id': ''}, {'id': 12}, [], None])
+def test_malformed_recorded_profile_cannot_fall_back_to_a_different_default(tmp_path, profile):
+    rollout = tmp_path / 'rollout.jsonl'
+    write_rollout(rollout, [('on-request', 'workspace-write', 'ordinary'), ('never', 'read-only', REVIEW)])
+    records = [json.loads(line) for line in rollout.read_text().splitlines()]
+    for record in records:
+        if record['type'] == 'turn_context' and record['payload']['approval_policy'] == 'on-request':
+            record['payload']['sandbox_policy'] = None
+            record['payload']['active_permission_profile'] = profile
+    rollout.write_text('\n'.join(json.dumps(r) for r in records) + '\n')
+    with pytest.raises(RuntimeError, match='recorded permission profile'):
+        codex_mod.policy_after_review(rollout, default_policy=lambda: {
+            'approvalPolicy': 'never', 'permissions': ':danger-full-access'})

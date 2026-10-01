@@ -141,6 +141,101 @@ def _flip_debug(msg: str) -> None:
         pass
 
 
+class CodexTurnBoundary:
+    """Read completed lifecycle records from the tracked primary rollout.
+
+    Codex notify also fires for auxiliary title turns. Those notifications
+    cannot establish a boundary in the primary turn. Read incrementally and
+    hold on unavailable, malformed, or partially written records.
+    """
+
+    def __init__(self) -> None:
+        self._identity: tuple[Path, int, int] | None = None
+        self._offset = 0
+        self._turn_id: str | None = None
+        self._terminal = False
+        self._pending_calls: set[str] = set()
+
+    def __call__(self, path: Path | None) -> bool:
+        if path is None:
+            return False
+        try:
+            with path.open("rb") as stream:
+                stat = os.fstat(stream.fileno())
+                identity = (path, stat.st_dev, stat.st_ino)
+                if identity != self._identity or stat.st_size < self._offset:
+                    self._identity = identity
+                    self._offset = 0
+                    self._turn_id = None
+                    self._terminal = False
+                    self._pending_calls.clear()
+                stream.seek(self._offset)
+                while line := stream.readline():
+                    if not line.endswith(b"\n"):
+                        return False
+                    self._offset = stream.tell()
+                    try:
+                        record = json.loads(line)
+                    except (ValueError, UnicodeDecodeError):
+                        self._turn_id = None
+                        self._terminal = False
+                        continue
+                    if not isinstance(record, dict):
+                        self._turn_id = None
+                        self._terminal = False
+                        continue
+                    payload = record.get("payload")
+                    if not isinstance(payload, dict):
+                        self._turn_id = None
+                        self._terminal = False
+                        continue
+                    record_type = record.get("type")
+                    if record_type == "response_item":
+                        kind = payload.get("type")
+                        if not isinstance(kind, str) or (self._terminal and (
+                            (kind == "message" and payload.get("role") == "user")
+                            or kind not in ("message", "reasoning", "function_call", "custom_tool_call",
+                                            "function_call_output", "custom_tool_call_output")
+                        )):
+                            self._turn_id = None
+                            self._terminal = False
+                        call_id = payload.get("call_id")
+                        if kind in ("function_call", "custom_tool_call",
+                                    "function_call_output", "custom_tool_call_output"):
+                            if not isinstance(call_id, str) or not call_id:
+                                self._turn_id = None
+                                self._terminal = False
+                            elif kind in ("function_call", "custom_tool_call"):
+                                if self._terminal:
+                                    self._turn_id = None
+                                    self._terminal = False
+                                self._pending_calls.add(call_id)
+                            else:
+                                self._pending_calls.discard(call_id)
+                        continue
+                    if record_type != "event_msg":
+                        if record_type not in ("session_meta", "turn_context", "world_state",
+                                               "compacted", "token_usage_record"):
+                            self._turn_id = None
+                            self._terminal = False
+                        continue
+                    kind = payload.get("type")
+                    turn_id = payload.get("turn_id")
+                    if kind == "task_started":
+                        self._turn_id = turn_id if isinstance(turn_id, str) and turn_id else None
+                        self._terminal = False
+                    elif kind in ("task_complete", "turn_aborted"):
+                        self._terminal = self._turn_id is not None and turn_id == self._turn_id
+                    elif not isinstance(kind, str) or (self._terminal and kind not in (
+                        "token_count", "thread_settings_applied", "item_completed",
+                    )):
+                        self._turn_id = None
+                        self._terminal = False
+        except OSError:
+            return False
+        return self._terminal and not self._pending_calls
+
+
 def wait_until_safe(
     transcript: Path | None,
     sentinel: Path | None,
@@ -150,6 +245,7 @@ def wait_until_safe(
     marker_wired: bool = False,
     provider: Callable[[], Path | None] | None = None,
     status_probe: Callable[[], str | None] | None = None,
+    turn_boundary: Callable[[Path | None], bool] | None = None,
 ) -> bool:
     """Block until the turn boundary. The transcript's last append lands
     before the Stop hook / notify touches the sentinel, so idle means the
@@ -186,6 +282,11 @@ def wait_until_safe(
     File mtimes and the marker-less quiescence comparison use wall-clock
     time so their readings are comparable.
 
+    With `turn_boundary` (wired codex), only the primary rollout lifecycle
+    establishes completion. Notify also fires for auxiliary title threads,
+    and housekeeping can append after a completed turn. Unknown or partial
+    primary lifecycle records hold the wait.
+
     With `status_probe` (claude sessions), the probe is the entire
     boundary test and the marker/quiescence rules above never run: the
     probe reads claude's own session registry, which distinguishes a
@@ -209,6 +310,11 @@ def wait_until_safe(
                 continue
             return True
         path = provider()
+        if turn_boundary is not None:
+            if turn_boundary(path):
+                return True
+            time.sleep(poll)
+            continue
         t, s = _mtime(path), _mtime(sentinel)
         if marker_wired:
             if path is not None and s > 0 and s >= t:
@@ -258,7 +364,8 @@ class FlipMonitor:
                  marker_wired: bool = False,
                  quiesce: float | None = None, poll: float = 0.2,
                  status_probe: Callable[[], str | None] | None = None,
-                 on_flip_decided: Callable[[], None] | None = None):
+                 on_flip_decided: Callable[[], None] | None = None,
+                 turn_boundary: Callable[[Path | None], bool] | None = None):
         self.control = control
         self.quit_bytes = quit_bytes
         self.transcript = transcript
@@ -267,6 +374,7 @@ class FlipMonitor:
         self.quiesce = _QUIESCE_S if quiesce is None else quiesce
         self.poll = poll
         self.status_probe = status_probe
+        self.turn_boundary = turn_boundary
         self.on_flip_decided = on_flip_decided
         self.flip_requested = False
         self.how = ""
@@ -338,6 +446,7 @@ class FlipMonitor:
                 marker_wired=self.marker_wired,
                 provider=lambda: self.transcript,
                 status_probe=self.status_probe,
+                turn_boundary=self.turn_boundary,
             )
             if self._stop.is_set():
                 return
@@ -616,6 +725,7 @@ class InteractiveRunner:
         monitor = FlipMonitor(
             control, adapter.quit_keystrokes(), transcript, sentinel,
             marker_wired=bool(hook_extra),
+            turn_boundary=CodexTurnBoundary() if active == "codex" and hook_extra else None,
             # capability check: adapters without a live status registry/probe
             # opt out by absence — a probe answering None would flip eagerly
             # mid-turn.

@@ -73,9 +73,12 @@ waits until the response finishes; press it again to cancel the switch.
 `tandem native` opens the first usable CLI in your configured order; use
 `tandem native --active codex` or `--active opencode` to choose another.
 
-When a native harness relies on a wired completion hook, a pending flip waits
-for its completion marker; transcript silence never ends a running tool call or approval wait.
-If the hook fails, cancel the switch or exit the native harness manually.
+For wired Codex launches, a pending flip waits for the tracked primary rollout
+to record its turn as completed or aborted; background title notifications cannot
+release it. Claude uses its native status registry; other wired harnesses require
+their completion marker. Transcript
+silence never ends a running tool call or approval wait. If completion cannot be
+confirmed, cancel the switch or exit the native harness manually.
 
 ## What's new in 0.5
 

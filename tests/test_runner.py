@@ -553,9 +553,9 @@ def test_monitor_passes_mode_through_to_wait(tmp_path, monkeypatch):
     seen = {}
 
     def fake_wait(transcript, sentinel, cancelled, quiesce=None, poll=0.2,
-                  marker_wired=False, provider=None, status_probe=None):
+                  marker_wired=False, provider=None, status_probe=None, turn_boundary=None):
         seen.update(quiesce=quiesce, poll=poll, marker_wired=marker_wired,
-                    provider_reads=provider())
+                    provider_reads=provider(), turn_boundary=turn_boundary)
         return True
 
     monkeypatch.setattr(runner, "wait_until_safe", fake_wait)
@@ -571,7 +571,7 @@ def test_monitor_passes_mode_through_to_wait(tmp_path, monkeypatch):
     m.stop()
     assert m.flip_requested is True
     assert seen == {"quiesce": 2.0, "poll": 0.05, "marker_wired": True,
-                    "provider_reads": None}
+                    "provider_reads": None, "turn_boundary": None}
 
 
 # -- the runner wiring the frame ------------------------------------------
@@ -1723,3 +1723,182 @@ def test_runner_pokes_the_poller_when_a_response_lands(env_factory, monkeypatch)
 
     monkeypatch.setattr(runner, "run_in_pty", fake_run_in_pty)
     runner.InteractiveRunner(env.session, lambda st, se, so, tg: _Sink()).run()
+
+
+def test_codex_auxiliary_notify_does_not_flip_running_primary_turn(env_factory, monkeypatch):
+    env = env_factory(active="codex")
+    env.codex_shadow.write_text(json.dumps({
+        "type": "event_msg", "payload": {"type": "task_started", "turn_id": "primary"},
+    }) + "\n")
+    made = {}
+    real_monitor = runner.FlipMonitor
+
+    def capture(*args, **kwargs):
+        made["monitor"] = real_monitor(*args, **kwargs)
+        return made["monitor"]
+
+    monkeypatch.setattr(runner, "FlipMonitor", capture)
+    monkeypatch.setattr(runner.PtyControl, "terminate", lambda *a, **kw: "test")
+
+    def native_turn(argv, **kwargs):
+        monitor = made["monitor"]
+        monitor.sentinel.touch()  # native title thread's notify, not primary completion
+        monitor.flip_pressed()
+        time.sleep(0.3)
+        assert not monitor.flip_requested
+        with env.codex_shadow.open("a") as stream:
+            stream.write(json.dumps({"type": "event_msg", "payload": {
+                "type": "task_complete", "turn_id": "primary",
+            }}) + "\n")
+        deadline = time.monotonic() + 2
+        while not monitor.flip_requested and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert monitor.flip_requested
+        return 0
+
+    monkeypatch.setattr(runner, "run_in_pty", native_turn)
+    result = runner.InteractiveRunner(env.session, _null_sink)
+    assert result.run() == 0
+    assert result.flip_requested
+
+
+def _codex_lifecycle(path, kind, turn_id="primary", mode="a"):
+    with path.open(mode) as stream:
+        stream.write(json.dumps({"type": "event_msg", "payload": {
+            "type": kind, "turn_id": turn_id,
+        }}) + "\n")
+
+
+@pytest.mark.parametrize("terminal", ["task_complete", "turn_aborted"])
+def test_codex_primary_boundary_terminal_and_late_writes(tmp_path, terminal):
+    path = tmp_path / "rollout.jsonl"
+    probe = runner.CodexTurnBoundary()
+    assert not probe(None)
+    assert not probe(path)
+    _codex_lifecycle(path, "task_started", mode="w")
+    assert not probe(path)
+    _codex_lifecycle(path, terminal, turn_id="auxiliary")
+    assert not probe(path)
+    _codex_lifecycle(path, terminal)
+    assert probe(path)
+    _codex_lifecycle(path, "token_count")
+    assert probe(path)  # housekeeping after the terminal event is not a new turn
+    _codex_lifecycle(path, "task_started", turn_id="next")
+    assert not probe(path)
+
+
+def test_codex_primary_boundary_partial_corrupt_replaced_and_truncated(tmp_path):
+    path = tmp_path / "rollout.jsonl"
+    probe = runner.CodexTurnBoundary()
+    _codex_lifecycle(path, "task_started", mode="w")
+    partial = json.dumps({"type": "event_msg", "payload": {
+        "type": "task_complete", "turn_id": "primary",
+    }})
+    with path.open("a") as stream:
+        stream.write(partial)
+    assert not probe(path)
+    with path.open("a") as stream:
+        stream.write("\n")
+    assert probe(path)
+    with path.open("a") as stream:
+        stream.write("invalid\n")
+    assert not probe(path)
+    _codex_lifecycle(path, "task_complete")
+    assert not probe(path)
+    _codex_lifecycle(path, "task_started", mode="w")
+    assert not probe(path)
+    _codex_lifecycle(path, "task_complete")
+    assert probe(path)
+    replacement = tmp_path / "replacement"
+    _codex_lifecycle(replacement, "task_started", mode="w")
+    replacement.replace(path)
+    assert not probe(path)
+    path.unlink()
+    assert not probe(path)
+
+
+def test_codex_primary_boundary_requires_tool_result_and_terminal(tmp_path):
+    path = tmp_path / "rollout.jsonl"
+    probe = runner.CodexTurnBoundary()
+    _codex_lifecycle(path, "task_started", mode="w")
+    with path.open("a") as stream:
+        stream.write(json.dumps({"type": "response_item", "payload": {
+            "type": "custom_tool_call", "call_id": "sleep",
+        }}) + "\n")
+    _codex_lifecycle(path, "task_complete")
+    assert not probe(path)
+    with path.open("a") as stream:
+        stream.write(json.dumps({"type": "response_item", "payload": {
+            "type": "custom_tool_call_output", "call_id": "sleep", "output": "done",
+        }}) + "\n")
+    assert probe(path)
+
+
+def test_codex_primary_boundary_no_lifecycle_and_error_without_terminal_hold(tmp_path):
+    path = tmp_path / "rollout.jsonl"
+    probe = runner.CodexTurnBoundary()
+    path.write_text(json.dumps({"type": "session_meta", "payload": {"id": "primary"}}) + "\n")
+    assert not probe(path)
+    _codex_lifecycle(path, "task_started")
+    _codex_lifecycle(path, "error")
+    assert not probe(path)
+
+
+def test_codex_custom_notify_retains_markerless_fallback(env_factory, monkeypatch):
+    from tandem.harness.codex import CodexAdapter
+    env = env_factory(active="codex")
+    monkeypatch.setattr(CodexAdapter, "hook_argv_extra", lambda self, sentinel: [])
+    monitor = _run_capturing_monitor(env, monkeypatch)
+    assert not monitor.marker_wired
+    assert monitor.turn_boundary is None
+
+
+@pytest.mark.parametrize("call_id", [None, "", 123])
+def test_codex_primary_boundary_malformed_call_identity_holds(tmp_path, call_id):
+    path = tmp_path / "rollout.jsonl"
+    probe = runner.CodexTurnBoundary()
+    _codex_lifecycle(path, "task_started", mode="w")
+    with path.open("a") as stream:
+        stream.write(json.dumps({"type": "response_item", "payload": {
+            "type": "custom_tool_call", "call_id": call_id,
+        }}) + "\n")
+    _codex_lifecycle(path, "task_complete")
+    assert not probe(path)
+
+
+@pytest.mark.parametrize("payload", [None, 1, [], "missing"])
+def test_codex_primary_boundary_malformed_payload_cannot_close_old_turn(tmp_path, payload):
+    path = tmp_path / "rollout.jsonl"
+    probe = runner.CodexTurnBoundary()
+    _codex_lifecycle(path, "task_started", mode="w")
+    record = {"type": "event_msg"}
+    if payload != "missing":
+        record["payload"] = payload
+    with path.open("a") as stream:
+        stream.write(json.dumps(record) + "\n")
+    _codex_lifecycle(path, "task_complete")
+    assert not probe(path)
+
+
+@pytest.mark.parametrize("record", [
+    {"type": "event_msg", "payload": {"type": "user_message", "message": "queued"}},
+    {"type": "response_item", "payload": {"type": "message", "role": "user"}},
+    {"type": "event_msg", "payload": {"type": "future_lifecycle"}},
+    {"type": "future_record", "payload": {}},
+    {"type": "event_msg", "payload": {}},
+    {"type": "response_item", "payload": {}},
+])
+def test_codex_primary_boundary_queued_or_unknown_record_invalidates_terminal(tmp_path, record):
+    path = tmp_path / "rollout.jsonl"
+    probe = runner.CodexTurnBoundary()
+    _codex_lifecycle(path, "task_started", mode="w")
+    _codex_lifecycle(path, "task_complete")
+    assert probe(path)
+    with path.open("a") as stream:
+        stream.write(json.dumps(record) + "\n")
+    assert not probe(path)
+    _codex_lifecycle(path, "task_complete")
+    assert not probe(path)
+    _codex_lifecycle(path, "task_started", turn_id="next")
+    _codex_lifecycle(path, "task_complete", turn_id="next")
+    assert probe(path)

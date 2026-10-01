@@ -186,8 +186,8 @@ pins), `/skip-permissions [on|off]` (turn claude's and codex's permission
 prompts off or on from the next turn — see
 [`skip_permissions`](#skip_permissions--no-permission-prompts-in-claude-and-codex)),
 `/compact` (compact the default harness's conversation: claude runs its
-built-in, codex `thread/compact/start`, opencode `summarize` with the
-pinned model or the last reply's), `/model` (list the default
+built-in, codex `thread/compact/start`, OpenCode 1 `summarize`, or OpenCode 2
+`compact` with the selected model), `/model` (list the default
 harness's models; `/model NAME` is `/harness:NAME`) and `/mode
 [ask|edits|plan|skip]` (the permission mode from the next turn; `/mode`
 alone prints it, `/skip-permissions on|off` is `/mode skip|ask`). `ask` is

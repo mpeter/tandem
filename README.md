@@ -74,9 +74,9 @@ waits until the response finishes; press it again to cancel the switch.
 `tandem native --active codex` or `--active opencode` to choose another.
 
 OpenCode has separate adapters for **1.18+** and **2.0.21+**. OpenCode 2 uses
-its native session import and settled transcript format. Newer major versions
-remain excluded until verified. Its native interface supports fresh pairs;
-chat requires the OpenCode 2 chat runtime, which is not yet enabled.
+its native session import, settled transcript format, authenticated HTTP API,
+and execution events. Fresh pairs support both the native interface and chat.
+Newer major versions remain excluded until verified.
 
 Retained OpenCode 1 sessions remain unsupported even after native migration
 completes: their converted history and sync cursors need verified reconciliation.

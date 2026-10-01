@@ -13,7 +13,7 @@ from conftest import claude_assistant, claude_user, write_line
 
 from tandem.chat.commands import Command
 from tandem.chat.composer import Composer
-from tandem.chat.events import (ApprovalRequest, Evidence, FileDiff, Idle, LimitsUpdate, Notice, QuestionRequest,
+from tandem.chat.events import (ApprovalRequest, Evidence, FileDiff, Idle, LimitsUpdate, Notice, QuestionCancelled, QuestionRequest,
                                 ReviewFinished, ReviewStarted, TextDelta, Verdict,
                                 ToolStarted, TurnFinished, TurnOutcome, TurnStarted)
 from tandem.chat.navigator import Note
@@ -321,7 +321,8 @@ def test_window_answers_close_releases_the_waiter_and_every_later_request():
     t = blocks_until_answered(answers, first, got)
     answers.close(); t.join(2)
     assert got == ["deny"]
-    assert answers.answer(QuestionRequest("what?", ())) == ""
+    with pytest.raises(QuestionCancelled):
+        answers.answer(QuestionRequest("what?", ()))
     assert answers.approve(ApprovalRequest("command", "ls")) == "deny"
     assert posted == [first]
 
@@ -1253,3 +1254,106 @@ def test_a_streamed_limit_publishes_its_windows(env_factory):
     env = env_factory(); w, d, out, _ = make_window(env)
     w.handle_event(LimitsUpdate("codex", "5h 30%", (("5h", 30),)))
     assert w.usage_state["windows"] == {"codex": [("5h", 30)]}
+
+
+@pytest.fixture
+def cancellation_env(env_factory):
+    env = env_factory()
+    try:
+        yield env
+    finally:
+        env.store.close()
+
+
+@pytest.mark.parametrize("field_kind", ["text", "single", "multi"])
+@pytest.mark.parametrize("input_bytes", [b"\x1b", b"\x03", b"deny\r", b"close"])
+def test_window_question_dismissal_and_literal_deny_reach_native_form(
+    cancellation_env, monkeypatch, field_kind, input_bytes,
+):
+    import queue
+
+    from tandem.chat.runtime.opencode2 import Opencode2Runtime, TurnState
+
+    env = cancellation_env
+    w, dispatcher, _, answers = make_window(env)
+    posted = queue.Queue()
+    monkeypatch.setattr(answers, "_post", posted.put)
+    runtime = Opencode2Runtime(ChatConfig(), base_url="http://127.0.0.1:1")
+    calls = []
+    monkeypatch.setattr(runtime, "_http", lambda method, path, body=None: calls.append((method, path, body)))
+    field = {"key": "question", "type": "multiselect" if field_kind == "multi" else "string"}
+    if field_kind != "text":
+        field["options"] = [{"label": "deny", "value": "deny"}, {"label": "allow", "value": "allow"}]
+    form = {"id": "frm_question", "sessionID": "ses_test", "fields": [field]}
+    failures = []
+
+    def handle():
+        try:
+            runtime.handle_event({"type": "form.created", "data": {"form": form}},
+                                 TurnState("ses_test", delivered=True), w.handle_event, answers)
+        except Exception as exc:
+            failures.append(exc)
+
+    worker = threading.Thread(target=handle, daemon=True)
+    worker.start()
+    request = posted.get(timeout=2)
+    assert isinstance(request, QuestionRequest)
+    w.handle_event(request)
+    dispatcher.busy = True
+    if input_bytes == b"close":
+        answers.close()
+    else:
+        w.handle_input(input_bytes)
+    worker.join(2)
+    assert not worker.is_alive()
+    assert failures == []
+    if input_bytes != b"close":
+        assert w.composer.mode == "prompt"
+    if input_bytes == b"deny\r":
+        value = ["deny"] if field_kind == "multi" else "deny"
+        assert calls == [("POST", "/api/session/ses_test/form/frm_question/reply",
+                          {"answer": {"question": value}})]
+        assert dispatcher.interrupts == 0
+    else:
+        assert calls == [("DELETE", "/api/session/ses_test/form/frm_question", None)]
+        assert dispatcher.interrupts == (0 if input_bytes == b"close" else 1)
+
+
+@pytest.mark.parametrize("input_bytes", [b"\x1b", b"\x03"])
+def test_window_approval_dismissal_still_rejects_native_permission(
+    cancellation_env, monkeypatch, input_bytes,
+):
+    import queue
+
+    from tandem.chat.runtime.opencode2 import Opencode2Runtime, TurnState
+
+    env = cancellation_env
+    w, dispatcher, _, answers = make_window(env)
+    posted = queue.Queue()
+    monkeypatch.setattr(answers, "_post", posted.put)
+    runtime = Opencode2Runtime(ChatConfig(), base_url="http://127.0.0.1:1")
+    calls = []
+    monkeypatch.setattr(runtime, "_http", lambda method, path, body=None: calls.append((method, path, body)))
+    failures = []
+
+    def handle():
+        try:
+            runtime.handle_event({"type": "permission.asked", "data": {
+                "id": "perm_test", "sessionID": "ses_test", "action": "bash", "resources": ["pwd"],
+            }}, TurnState("ses_test", delivered=True), w.handle_event, answers)
+        except Exception as exc:
+            failures.append(exc)
+
+    worker = threading.Thread(target=handle, daemon=True)
+    worker.start()
+    request = posted.get(timeout=2)
+    assert isinstance(request, ApprovalRequest)
+    w.handle_event(request)
+    dispatcher.busy = True
+    w.handle_input(input_bytes)
+    worker.join(2)
+    assert not worker.is_alive()
+    assert failures == []
+    assert calls == [("POST", "/api/session/ses_test/permission/perm_test/reply",
+                      {"decision": "reject"})]
+    assert dispatcher.interrupts == 1

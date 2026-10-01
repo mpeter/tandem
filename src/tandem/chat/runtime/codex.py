@@ -34,7 +34,7 @@ from ... import paths
 from ...harness import get_adapter
 from ...ratelimit import Window, format_windows, window_label
 from ..events import (Answers, ApprovalRequest, Failure, FileDiff, LimitsUpdate, LiveEvent,
-                      QuestionRequest, TextDelta, ThinkingDelta, ToolFinished, ToolOutput,
+                      QuestionCancelled, QuestionRequest, TextDelta, ThinkingDelta, ToolFinished, ToolOutput,
                       ToolStarted, TurnFinished, TurnOutcome)
 from ..navigator import REVIEW_PROMPT_PREFIX
 from . import child_env, first_line, terminate
@@ -774,6 +774,10 @@ class CodexRuntime:
                 outcome = self.handle(m, send, emit, answers)
                 if outcome is not None:
                     break
+        except QuestionCancelled:
+            self.interrupt()
+            outcome = TurnOutcome("interrupted")
+            emit(TurnFinished("interrupted", ""))
         finally:
             self._teardown(proc, drain, pump)
             self._compacting = False        # a late thread/compacted must not end the next turn

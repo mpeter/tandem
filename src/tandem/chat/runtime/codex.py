@@ -2,7 +2,7 @@
 line, over stdio (the same transport the codex Python SDK's client.py uses).
 
   initialize {clientInfo} -> initialized (notification)
-  thread/resume {threadId, cwd[, approvalPolicy, sandbox]}   or   thread/start {cwd[, …]}
+  thread/resume {threadId, cwd[, approvalPolicy, permissions]}   or   thread/start {cwd[, …]}
   turn/start {threadId, input:[{type:"text", text}][, model]}
   … notifications (item/*, turn/*, thread/tokenUsage/updated,
     account/rateLimits/updated) and server requests (*/requestApproval,
@@ -74,6 +74,10 @@ _REVIEW_POLICY = ("never", "read-only")
 # `on-failure`, a sandbox type from another release) would fail validation
 _APPROVAL_POLICIES = ("untrusted", "on-request", "never")
 _SANDBOX_MODES = ("read-only", "workspace-write", "danger-full-access")
+_PERMISSION_PROFILES = {"read-only": ":read-only", "workspace-write": ":workspace",
+                        "danger-full-access": ":danger-full-access"}
+_EFFECTIVE_SANDBOX_TYPES = {"read-only": "readOnly", "workspace-write": "workspaceWrite",
+                            "danger-full-access": "dangerFullAccess"}
 
 
 def _user_text(rec: dict) -> str | None:
@@ -96,8 +100,8 @@ def _user_text(rec: dict) -> str | None:
     return None
 
 
-def _turns(path: Path) -> list[tuple[str, str, bool]]:
-    """`(approval_policy, sandbox type, is_review)` of every turn_context
+def _turns(path: Path) -> list[tuple[str, str, str | None, bool]]:
+    """`(approval_policy, sandbox type, profile id, is_review)` of every turn_context
     record in a rollout, in file order. Only codex writes turn_context, one
     per turn it ran; a turn is a review when a user record after it (before
     the next turn_context) starts, untagged, with the review prompt. Synced
@@ -106,7 +110,7 @@ def _turns(path: Path) -> list[tuple[str, str, bool]]:
     `task_started` since the previous one is a mid-turn compaction
     continuation and keeps the previous turn's review mark. Unparsable lines
     are skipped; an unreadable file has none."""
-    found: list[tuple[str, str, bool]] = []
+    found: list[tuple[str, str, str | None, bool]] = []
     started = False
     try:
         with open(path, encoding="utf-8", errors="replace") as f:
@@ -132,10 +136,13 @@ def _turns(path: Path) -> list[tuple[str, str, bool]]:
                     sandbox = payload.get("sandbox_policy")
                     sandbox = sandbox.get("type") if isinstance(sandbox, dict) else sandbox
                     approval = payload.get("approval_policy")
+                    active = payload.get("active_permission_profile")
+                    profile = active.get("id") if isinstance(active, dict) else None
+                    profile = profile if isinstance(profile, str) and profile else None
                     if isinstance(approval, str) and isinstance(sandbox, str):
                         # a continuation (no task_started) is the same turn
-                        found.append((approval, sandbox,
-                                      False if started or not found else found[-1][2]))
+                        found.append((approval, sandbox, profile,
+                                      False if started or not found else found[-1][3]))
                         started = False
                     continue
                 if not found:
@@ -143,8 +150,8 @@ def _turns(path: Path) -> list[tuple[str, str, bool]]:
                 text = _user_text(rec)
                 # sticky: the other harness's follow-up syncs in after a
                 # review with no turn_context and must not unmark it
-                if text is not None and text.startswith(REVIEW_PROMPT_PREFIX) and not found[-1][2]:
-                    found[-1] = (found[-1][0], found[-1][1], True)
+                if text is not None and text.startswith(REVIEW_PROMPT_PREFIX) and not found[-1][3]:
+                    found[-1] = (*found[-1][:3], True)
     except OSError:
         return []
     return found
@@ -165,7 +172,7 @@ def codex_default_policy() -> dict:
             "sandbox": sandbox if sandbox in _SANDBOX_MODES else "read-only"}
 
 
-def policy_after_review(path: Path | None) -> dict | None:
+def policy_after_review(path: Path | None, *, default_policy: Callable[[], dict] | None = None) -> dict | None:
     """The policy to put back when the thread's last codex-run turn was a
     review.
 
@@ -176,19 +183,25 @@ def policy_after_review(path: Path | None) -> dict | None:
     policy of the last non-review turn — exactly what codex would have
     persisted had the review not run, so a user's own `never` / `read-only`
     is put back as itself — or codex's default when no earlier turn has one.
-    A recorded policy the protocol does not know is treated as absent:
+    Named profile provenance is preserved when the rollout records it. The
+    runtime supplies the server's effective configuration for the fallback;
+    standalone callers use the local user config. A recorded policy the
+    protocol does not know is treated as absent:
     sending it would fail thread/resume, and with no new turn_context, every
     turn after it."""
     if path is None:
         return None
     turns = _turns(path)
-    if not turns or not turns[-1][2]:
+    if not turns or not turns[-1][3]:
         return None
-    for approval, sandbox, is_review in reversed(turns):
+    for approval, sandbox, profile, is_review in reversed(turns):
         if is_review or approval not in _APPROVAL_POLICIES or sandbox not in _SANDBOX_MODES:
             continue
-        return {"approvalPolicy": approval, "sandbox": sandbox}
-    return codex_default_policy()
+        restored = {"approvalPolicy": approval, "sandbox": sandbox}
+        if profile is not None:
+            restored["permissions"] = profile
+        return restored
+    return default_policy() if default_policy is not None else codex_default_policy()
 
 
 _REQUEST_MODELS = {
@@ -626,8 +639,64 @@ class CodexRuntime:
             self._proc = None
 
     def _init_params(self) -> dict:
-        return cp.InitializeParams(clientInfo=cp.ClientInfo(name="tandem", version=_VERSION)) \
+        return cp.InitializeParams(clientInfo=cp.ClientInfo(name="tandem", version=_VERSION),
+                                   capabilities=cp.InitializeCapabilities(experimentalApi=True)) \
             .model_dump(by_alias=True, exclude_none=True)
+
+    def _profile_allowed(self, proc, q, profile: str, emit, answers) -> str | None:
+        """Resolve permission profiles from the server's effective requirements."""
+        params: dict = {}
+        cursors: set[str] = set()
+        while True:
+            r = self._call(proc, q, "permissionProfile/list", params, emit, answers)
+            if "error" in r:
+                return "codex cannot select permission profiles: " + str(r["error"].get("message", r["error"]))
+            result = r.get("result")
+            if not isinstance(result, dict):
+                return "codex returned an invalid permission profile list"
+            for entry in result.get("data") or []:
+                if isinstance(entry, dict) and entry.get("id") == profile:
+                    if entry.get("allowed") is True:
+                        return None
+                    return f"codex requirements do not allow permission profile {profile}"
+            cursor = result.get("nextCursor")
+            if cursor is None:
+                return f"codex did not list permission profile {profile}"
+            if not isinstance(cursor, str) or cursor in cursors:
+                return "codex returned invalid permission profile pagination"
+            cursors.add(cursor)
+            params = {"cursor": cursor}
+
+    def _default_policy(self, proc, q, cwd: str, emit, answers) -> dict:
+        r = self._call(proc, q, "config/read", {"cwd": cwd, "includeLayers": False}, emit, answers)
+        if "error" in r:
+            raise RuntimeError("codex cannot restore its default policy: " + str(r["error"].get("message", r["error"])))
+        conf = (r.get("result") or {}).get("config") or {}
+        approval, sandbox = conf.get("approval_policy"), conf.get("sandbox_mode")
+        if approval not in _APPROVAL_POLICIES or sandbox not in _SANDBOX_MODES:
+            raise RuntimeError("codex did not report a supported default policy")
+        policy = {"approvalPolicy": approval, "sandbox": sandbox}
+        profile = conf.get("default_permissions")
+        if isinstance(profile, str) and profile:
+            policy["permissions"] = profile
+        return policy
+
+    @staticmethod
+    def _policy_mismatch(result: dict, overrides: dict, sandbox: str | None) -> str | None:
+        """Do not run a turn under a policy different from the selected mode."""
+        approval = overrides.get("approvalPolicy")
+        if approval is not None and result.get("approvalPolicy") != approval:
+            return f"codex did not apply approval policy {approval}"
+        profile = overrides.get("permissions")
+        if profile is not None:
+            active = result.get("activePermissionProfile") or {}
+            effective = result.get("sandbox") or {}
+            if not isinstance(active, dict) or not isinstance(effective, dict) \
+                    or sandbox is None \
+                    or active.get("id") != profile \
+                    or effective.get("type") != _EFFECTIVE_SANDBOX_TYPES.get(sandbox):
+                return f"codex did not apply permission profile {profile} ({sandbox})"
+        return None
 
     def list_models(self, session) -> list[str]:
         """`model/list` on a thread-less app-server: one line per visible
@@ -699,9 +768,26 @@ class CodexRuntime:
                 # the only place ask mode sends a policy, and only to undo a
                 # review's: codex keeps the review's never/read-only on the
                 # thread. setdefault, so a mode preset or codex_* key still wins
-                restore = policy_after_review(get_adapter("codex").transcript_path(session.cwd, native_id))
+                try:
+                    restore = policy_after_review(
+                        get_adapter("codex").transcript_path(session.cwd, native_id),
+                        default_policy=lambda: self._default_policy(proc, q, session.cwd, emit, answers))
+                except RuntimeError as exc:
+                    return fail(str(exc))
+                explicit_sandbox = "sandbox" in overrides
                 for k, v in (restore or {}).items():
+                    if k == "permissions" and explicit_sandbox:
+                        continue
                     overrides.setdefault(k, v)
+            sandbox = overrides.pop("sandbox", None)
+            if sandbox is not None:
+                profile = overrides.get("permissions") or _PERMISSION_PROFILES.get(sandbox)
+                if profile is None:
+                    return fail(f"unsupported codex sandbox mode: {sandbox}")
+                error = self._profile_allowed(proc, q, profile, emit, answers)
+                if error:
+                    return fail(error)
+                overrides["permissions"] = profile
             if native_id:
                 params = cp.ThreadResumeParams(threadId=native_id, cwd=session.cwd, **overrides)
                 r = self._call(proc, q, "thread/resume", params.model_dump(by_alias=True, exclude_none=True), emit, answers)
@@ -720,6 +806,9 @@ class CodexRuntime:
                 if not thread_id:
                     return fail("thread/start returned no thread id")
                 new_id = thread_id
+            mismatch = self._policy_mismatch(r.get("result") or {}, overrides, sandbox)
+            if mismatch:
+                return fail(mismatch)
             self._thread_id = thread_id
             if self._compacting:
                 # the response is an empty object; completion is the

@@ -69,7 +69,8 @@ def test_codex_review_runs_on_a_deleted_fork_read_only_with_the_schema(codex_env
     assert seen["id"] != env.session.native_id("codex")
     resume = env.params("thread/resume")
     assert resume["threadId"] == seen["id"]
-    assert resume["approvalPolicy"] == "never" and resume["sandbox"] == "read-only"
+    assert resume["approvalPolicy"] == "never" and resume["permissions"] == ":read-only"
+    assert "sandbox" not in resume
     turn = env.params("turn/start")
     assert turn["outputSchema"] == {"type": "object"} and turn["model"] == "gpt-x"
     assert not lock.locked()                                         # released after the copy

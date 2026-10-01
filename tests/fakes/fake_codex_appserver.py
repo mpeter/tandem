@@ -51,6 +51,27 @@ def reply_out(m):
         json.dump(m.get("result") or {"error": m.get("error")}, f)
 
 
+def thread_result(thread_id, params):
+    profiles = {":read-only": "readOnly", ":workspace": "workspaceWrite",
+                ":danger-full-access": "dangerFullAccess", "restricted-project": "workspaceWrite"}
+    # Mimic an administrator's workspace default taking precedence over a
+    # legacy sandbox override. Named profile selection must avoid that trap.
+    profile = params.get("permissions", ":workspace")
+    sandbox = profiles[profile]
+    if os.environ.get("FAKE_POLICY_MISMATCH") == "sandbox":
+        sandbox = "workspaceWrite"
+    result = {"thread": {"id": thread_id, "cwd": params.get("cwd"), "turns": []},
+              "model": "gpt-fake", "approvalPolicy": params.get("approvalPolicy", "on-request"),
+              "activePermissionProfile": {"id": profile}, "sandbox": {"type": sandbox}}
+    if os.environ.get("FAKE_POLICY_MISMATCH") == "profile":
+        result["activePermissionProfile"] = {"id": ":workspace"}
+    if os.environ.get("FAKE_POLICY_MISMATCH") == "approval":
+        result["approvalPolicy"] = "untrusted"
+    if os.environ.get("FAKE_POLICY_MISMATCH") == "missing":
+        return {"thread": result["thread"], "model": "gpt-fake"}
+    return result
+
+
 def finish(thread_id, text="DONE"):
     notify("item/started", {"threadId": thread_id, "turnId": TURN, "startedAtMs": 3,
                             "item": item("agentMessage", id="msg-1", text="", phase="final_answer")})
@@ -78,15 +99,30 @@ def main():
             out({"jsonrpc": "2.0", "id": rid, "result": {"userAgent": "fake", "codexHome": "/x", "platformFamily": "unix", "platformOs": "macos"}})
         elif meth == "initialized":
             pass
+        elif meth == "config/read":
+            out({"jsonrpc": "2.0", "id": rid, "result": {"config": {
+                "approval_policy": "on-request", "sandbox_mode": "workspace-write", "default_permissions": None}}})
+        elif meth == "permissionProfile/list":
+            if os.environ.get("FAKE_PROFILES_UNSUPPORTED"):
+                out({"jsonrpc": "2.0", "id": rid, "error": {"code": -32601, "message": "unknown method"}})
+                continue
+            data = [{"id": p, "allowed": p != os.environ.get("FAKE_PROFILE_DENIED")}
+                    for p in (":read-only", ":workspace", ":danger-full-access", "restricted-project")
+                    if p != os.environ.get("FAKE_PROFILE_MISSING")]
+            if os.environ.get("FAKE_PROFILES_PAGINATED") and not m["params"].get("cursor"):
+                result = {"data": [], "nextCursor": "page-two"}
+            else:
+                result = {"data": data, "nextCursor": None}
+            out({"jsonrpc": "2.0", "id": rid, "result": result})
         elif meth == "thread/resume":
             if scenario == "lock":
                 out({"jsonrpc": "2.0", "id": rid, "error": {"code": -32600, "message": f"thread {m['params']['threadId']} already has an active writer"}})
                 continue
             thread_id = m["params"]["threadId"]
-            out({"jsonrpc": "2.0", "id": rid, "result": {"thread": {"id": thread_id, "cwd": m["params"].get("cwd"), "turns": []}, "model": "gpt-fake"}})
+            out({"jsonrpc": "2.0", "id": rid, "result": thread_result(thread_id, m["params"])})
         elif meth == "thread/start":
             thread_id = "thread-new"
-            out({"jsonrpc": "2.0", "id": rid, "result": {"thread": {"id": thread_id, "cwd": m["params"].get("cwd"), "turns": []}, "model": "gpt-fake"}})
+            out({"jsonrpc": "2.0", "id": rid, "result": thread_result(thread_id, m["params"])})
         elif meth == "turn/start":
             if scenario == "freshfail":
                 out({"jsonrpc": "2.0", "id": rid,

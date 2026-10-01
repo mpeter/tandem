@@ -143,6 +143,11 @@ tandem pins what it was built against (observed formats documented in
 | Codex CLI | 0.153.4 | ≥ 0.140, < 0.160 |
 | opencode | 1.18.15 | ≥ 1.18 (no ceiling) |
 
+These ranges cover session-format compatibility. Codex profile-dependent chat
+modes and reviews additionally require the experimental permission-profile APIs
+described in [configuration](configuration.md#chat--the-unified-window). Their earliest supporting
+CLI version has not been established; API availability was checked on 0.159.3.
+
 Above a range's ceiling, tandem warns and asks you to run `tandem doctor`
 before trusting sync; below the floor the harness is excluded from the
 session (the format genuinely predates what tandem was built on).

@@ -79,7 +79,7 @@ def test_model_and_config_overrides(env):
     rec = Recorder("allow")
     rt.run_turn(env.session, "thread-1", "go", "gpt-5.5", rec.emit, rec)
     assert env.params("thread/resume") == {"threadId": "thread-1", "cwd": env.session.cwd,
-                                           "approvalPolicy": "never", "sandbox": "read-only"}
+                                           "approvalPolicy": "never", "permissions": ":read-only"}
     assert env.params("turn/start")["model"] == "gpt-5.5"
 
 
@@ -89,7 +89,7 @@ def test_skip_permissions_overrides_approval_and_sandbox(env):
     rt.run_turn(env.session, "thread-1", "go", "", rec.emit, rec)
     assert env.params("thread/resume") == {"threadId": "thread-1", "cwd": env.session.cwd,
                                            "approvalPolicy": "never",
-                                           "sandbox": "danger-full-access"}
+                                           "permissions": ":danger-full-access"}
 
 
 def test_skip_permissions_yields_to_an_explicit_codex_key(env):
@@ -99,7 +99,7 @@ def test_skip_permissions_yields_to_an_explicit_codex_key(env):
     rt.run_turn(env.session, "thread-1", "go", "", rec.emit, rec)
     assert env.params("thread/resume") == {"threadId": "thread-1", "cwd": env.session.cwd,
                                            "approvalPolicy": "never",
-                                           "sandbox": "workspace-write"}
+                                           "permissions": ":workspace"}
 
 
 def test_always_and_deny_decisions(env, monkeypatch):
@@ -578,13 +578,13 @@ def test_a_review_turn_is_read_only_never_approves_and_carries_the_schema(env):
     rec = Recorder("allow")
     rt.run_turn(env.session, "thread-1", "review", "gpt-5.5", rec.emit, rec, review={"type": "object"})
     assert env.params("thread/resume") == {"threadId": "thread-1", "cwd": env.session.cwd,
-                                           "approvalPolicy": "never", "sandbox": "read-only"}
+                                           "approvalPolicy": "never", "permissions": ":read-only"}
     assert env.params("turn/start")["outputSchema"] == {"type": "object"}
     assert env.params("turn/start")["model"] == "gpt-5.5"
     # the same runtime, next turn, is the window's again
     (env.tmp / "params.jsonl").unlink()
     rt.run_turn(env.session, "thread-1", "go", "", rec.emit, rec)
-    assert env.params("thread/resume")["sandbox"] == "workspace-write"
+    assert env.params("thread/resume")["permissions"] == ":workspace"
     assert "outputSchema" not in env.params("turn/start")
 
 
@@ -696,7 +696,7 @@ def test_mode_sets_policy_and_sandbox(env, mode, policy, sandbox):
     rt = CodexRuntime(ChatConfig(mode=mode), binary=[sys.executable, str(FAKE)])
     rt.run_turn(env.session, "thread-1", "go", "", Recorder().emit, Recorder())
     assert env.params("thread/resume") == {"threadId": "thread-1", "cwd": env.session.cwd,
-                                           "approvalPolicy": policy, "sandbox": sandbox}
+                                           "approvalPolicy": policy, "permissions": codex_mod._PERMISSION_PROFILES[sandbox]}
 
 
 def test_ask_mode_inherits_the_codex_config(env):
@@ -709,7 +709,7 @@ def test_an_explicit_codex_key_wins_over_the_mode(env):
     rt = CodexRuntime(ChatConfig(mode="edits", codex_sandbox="read-only"), binary=[sys.executable, str(FAKE)])
     rt.run_turn(env.session, "thread-1", "go", "", Recorder().emit, Recorder())
     assert env.params("thread/resume") == {"threadId": "thread-1", "cwd": env.session.cwd,
-                                           "approvalPolicy": "on-request", "sandbox": "read-only"}
+                                           "approvalPolicy": "on-request", "permissions": ":read-only"}
 
 
 def test_a_mode_change_during_startup_does_not_reach_the_running_turn(env, monkeypatch):
@@ -727,7 +727,7 @@ def test_a_mode_change_during_startup_does_not_reach_the_running_turn(env, monke
 
     monkeypatch.setattr(rt, "_call", call_and_flip)
     rt.run_turn(env.session, "thread-1", "go", "", Recorder().emit, Recorder())
-    assert env.params("thread/resume")["sandbox"] == "read-only"       # plan, not skip
+    assert env.params("thread/resume")["permissions"] == ":read-only"       # plan, not skip
 
 
 # -- FileDiff from a completed fileChange -----------------------------------------
@@ -931,7 +931,7 @@ def test_codex_default_policy_reads_config_toml_and_falls_back(tmp_path, monkeyp
 def test_an_ask_mode_turn_after_a_review_resends_the_pre_review_policy(env, monkeypatch):
     consulted = []
 
-    def restore(path):
+    def restore(path, **kwargs):
         consulted.append(path)
         return {"approvalPolicy": "on-request", "sandbox": "workspace-write"}
 
@@ -943,19 +943,19 @@ def test_an_ask_mode_turn_after_a_review_resends_the_pre_review_policy(env, monk
     rt.run_turn(env.session, "thread-1", "go", "", rec.emit, rec)
     assert consulted == [rollout]                       # the thread's own rollout is read
     assert env.params("thread/resume") == {"threadId": "thread-1", "cwd": env.session.cwd,
-                                           "approvalPolicy": "on-request", "sandbox": "workspace-write"}
+                                           "approvalPolicy": "on-request", "permissions": ":workspace"}
     # an explicit key keeps its slot; only the inherited one is restored
     (env.tmp / "params.jsonl").unlink()
     rt = CodexRuntime(ChatConfig(codex_sandbox="read-only"), binary=[sys.executable, str(FAKE)])
     rt.run_turn(env.session, "thread-1", "go", "", rec.emit, rec)
     assert env.params("thread/resume") == {"threadId": "thread-1", "cwd": env.session.cwd,
-                                           "approvalPolicy": "on-request", "sandbox": "read-only"}
+                                           "approvalPolicy": "on-request", "permissions": ":read-only"}
     # a review turn pins its own and never asks
     consulted.clear(); (env.tmp / "params.jsonl").unlink()
     rt.run_turn(env.session, "thread-1", "review", "", rec.emit, rec, review={"type": "object"})
     assert consulted == []
     assert env.params("thread/resume") == {"threadId": "thread-1", "cwd": env.session.cwd,
-                                           "approvalPolicy": "never", "sandbox": "read-only"}
+                                           "approvalPolicy": "never", "permissions": ":read-only"}
     # a fresh thread has no review to undo
     (env.tmp / "params.jsonl").unlink()
     monkeypatch.setenv("FAKE_CODEX_SCENARIO", "fresh")
@@ -963,3 +963,79 @@ def test_an_ask_mode_turn_after_a_review_resends_the_pre_review_policy(env, monk
         env.session, None, "go", "", rec.emit, rec)
     assert consulted == []
     assert env.params("thread/start") == {"cwd": env.session.cwd}
+
+
+@pytest.mark.parametrize("native_id", [None, "thread-1"])
+@pytest.mark.parametrize("mismatch", ["sandbox", "profile", "approval", "missing"])
+def test_policy_mismatch_prevents_a_turn(env, monkeypatch, native_id, mismatch):
+    monkeypatch.setenv("FAKE_POLICY_MISMATCH", mismatch)
+    rec = Recorder()
+    rt = CodexRuntime(ChatConfig(mode="plan"), binary=[sys.executable, str(FAKE)])
+    out = rt.run_turn(env.session, native_id, "go", "", rec.emit, rec)
+    assert out.status == "failed" and "did not apply" in out.error
+    assert env.params("turn/start") is None
+    assert rec.events[-1] == TurnFinished("failed", "")
+    assert out.native_id == ("thread-new" if native_id is None else None)
+
+
+@pytest.mark.parametrize("setting,value,error", [
+    ("FAKE_PROFILE_DENIED", ":read-only", "do not allow"),
+    ("FAKE_PROFILE_MISSING", ":read-only", "did not list"),
+    ("FAKE_PROFILES_UNSUPPORTED", "1", "cannot select permission profiles"),
+])
+@pytest.mark.parametrize("native_id", [None, "thread-1"])
+def test_plan_fails_before_thread_open_when_profiles_are_unavailable(env, monkeypatch, setting, value, error, native_id):
+    monkeypatch.setenv(setting, value)
+    rec = Recorder()
+    rt = CodexRuntime(ChatConfig(mode="plan"), binary=[sys.executable, str(FAKE)])
+    out = rt.run_turn(env.session, native_id, "go", "", rec.emit, rec)
+    assert out.status == "failed" and error in out.error
+    assert env.params("thread/start") is None
+    assert env.params("thread/resume") is None
+    assert env.params("turn/start") is None
+    assert out.native_id is None
+    assert rec.events[-1] == TurnFinished("failed", "")
+
+
+def test_profile_discovery_follows_pagination(env, monkeypatch):
+    monkeypatch.setenv("FAKE_PROFILES_PAGINATED", "1")
+    rec = Recorder()
+    rt = CodexRuntime(ChatConfig(mode="plan"), binary=[sys.executable, str(FAKE)])
+    out = rt.run_turn(env.session, "thread-1", "go", "", rec.emit, rec)
+    requests = [json.loads(line) for line in (env.tmp / "params.jsonl").read_text().splitlines()]
+    assert out.status == "completed"
+    assert [r["params"] for r in requests if r["method"] == "permissionProfile/list"] == [{}, {"cursor": "page-two"}]
+    assert env.params("initialize")["capabilities"]["experimentalApi"] is True
+    assert "sandbox" not in env.params("thread/resume")
+
+
+def test_ask_after_first_review_restores_effective_layered_default(env):
+    rollout = env.tmp / ".codex" / "sessions" / "2026" / "rollout-2026-09-27T00-00-00-thread-1.jsonl"
+    rollout.parent.mkdir(parents=True)
+    write_rollout(rollout, [("never", "read-only", REVIEW)])
+    rec = Recorder()
+    out = env.runtime.run_turn(env.session, "thread-1", "go", "", rec.emit, rec)
+    assert out.status == "completed"
+    assert env.params("config/read") == {"cwd": env.session.cwd, "includeLayers": False}
+    assert env.params("thread/resume")["permissions"] == ":workspace"
+    assert env.params("thread/resume")["approvalPolicy"] == "on-request"
+
+
+def test_review_restoration_preserves_named_profile_and_explicit_override(env):
+    rollout = env.tmp / ".codex" / "sessions" / "2026" / "rollout-2026-09-27T00-00-00-thread-1.jsonl"
+    rollout.parent.mkdir(parents=True)
+    write_rollout(rollout, [("on-request", "workspace-write", "go"), ("never", "read-only", REVIEW)])
+    records = [json.loads(line) for line in rollout.read_text().splitlines()]
+    for record in records:
+        if record["type"] == "turn_context" and record["payload"]["approval_policy"] == "on-request":
+            record["payload"]["active_permission_profile"] = {"id": "restricted-project"}
+    rollout.write_text("\n".join(json.dumps(r) for r in records) + "\n")
+    rec = Recorder()
+    out = env.runtime.run_turn(env.session, "thread-1", "go", "", rec.emit, rec)
+    assert out.status == "completed"
+    assert env.params("thread/resume")["permissions"] == "restricted-project"
+    assert env.params("config/read") is None
+    (env.tmp / "params.jsonl").unlink()
+    rt = CodexRuntime(ChatConfig(mode="plan"), binary=[sys.executable, str(FAKE)])
+    assert rt.run_turn(env.session, "thread-1", "go", "", rec.emit, rec).status == "completed"
+    assert env.params("thread/resume")["permissions"] == ":read-only"

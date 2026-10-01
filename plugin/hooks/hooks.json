@@ -4,7 +4,41 @@
       {
         "matcher": "Agent|Task",
         "hooks": [
-          {"type": "command", "command": "tandem hook-route || true"}
+          {
+            "type": "command",
+            "command": "tandem hook-route || true"
+          }
+        ]
+      },
+      {
+        "matcher": "*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "tandem hook-relay pre"
+          }
+        ]
+      }
+    ],
+    "SubagentStop": [
+      {
+        "matcher": "^tandem:(gpt|codex-worker)$",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "tandem hook-relay stop"
+          }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": "Agent|Task",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "tandem hook-relay post"
+          }
         ]
       }
     ]

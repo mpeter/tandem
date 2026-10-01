@@ -473,7 +473,7 @@ class TestSandboxForMode:
         # unknown/future modes MUST degrade to no-write: an unrecognized
         # string is not consent
         for mode in ("default", "plan", "dontAsk", "auto", "", None, 7):
-            assert sandbox_for_mode(mode) == ""
+            assert sandbox_for_mode(mode) == "read-only"
 
 
 class TestSandboxStamp:
@@ -504,12 +504,12 @@ class TestSandboxStamp:
         env = env_factory(active="claude")
         self._hook(env, "acceptEdits")
         self._hook(env, "default")
-        assert self._stamp(env).read_text() == ""
+        assert self._stamp(env).read_text() == "read-only"
 
     def test_missing_mode_stamps_empty(self, env_factory):
         env = env_factory(active="claude")
         self._hook(env, None)
-        assert self._stamp(env).read_text() == ""
+        assert self._stamp(env).read_text() == "read-only"
 
     def test_no_session_writes_no_stamp(self, tmp_path, monkeypatch):
         monkeypatch.setenv("TANDEM_HOME", str(tmp_path / ".tandem"))

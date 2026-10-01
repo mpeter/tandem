@@ -52,7 +52,7 @@ open a fresh session.
   dispatch. `hook-route` itself always exits 0 and prints nothing when in
   doubt, so its failure mode is "dispatch natively".
 - **`agents/codex-worker.md`** — the bridge the hook rewrites dispatches
-  to. `model: haiku`, `tools: Bash(tandem sub:*)`. It runs exactly one
+  to. `model: haiku`, `tools: Bash, SubagentHandback`. It runs exactly one
   command — `tandem sub -q` with the brief on stdin via heredoc — and
   returns that command's stdout as its final message, verbatim; the body's
   first rule is that it never does the task itself. Its description tells
@@ -67,6 +67,41 @@ open a fresh session.
   `tandem sub` resolves the name against codex's own catalog. The body is
   identical to `codex-worker.md`; only the description differs, so both
   agents behave the same once dispatched.
+
+The plugin's scoped `hook-relay` hooks enforce the bridge contract. Before
+any tool runs inside `tandem:gpt` or `tandem:codex-worker`, only a single
+`tandem sub -q` command with a quoted heredoc is accepted. The entire command
+is validated; appended commands, shell expansions outside the quoted brief,
+other flags and background execution are rejected. The guard injects an
+explicit sandbox when no flag is supplied: nonwrite permission modes use
+read-only, and edit-consenting modes use workspace-write. An explicit write
+retry outside an edit-consenting mode asks for user approval. For a follow-up
+that retries the original task, send exactly `tandem-retry: workspace-write`
+(the preferred control message). `Retry with write access` and `Retry the
+same task with write access` also work, with optional `Please`, case changes,
+outer whitespace, and one final punctuation mark. These controls preserve
+the original brief while requiring a fresh worker result; other follow-up
+messages become new assignments. Codex receives
+a matching named permissions override as well as `--sandbox`, so a managed
+workspace default cannot silently override read-only.
+
+Quiet worker output includes a `[tandem-sub receipt]` JSON trailer containing
+the worker id, model, exit code and task digest. `SubagentHandback` and
+`SubagentStop` require a matching dispatch/result pair in the relay's own
+transcript. Before handback executes, its input message is replaced with
+the verified worker stdout, including every receipt and model footer;
+the relay does not have to reconstruct the text. A dispatch that failed
+returns the same error output with the
+`[tandem-sub failed]` prefix; a relay that never invoked Codex cannot pass.
+The parent dispatch hook labels asynchronous results pending and reports
+unverified completed handbacks as unverified rather than treating them as
+Codex work. Other agents are unaffected.
+
+These hooks live in `hooks/hooks.json`: Claude ignores `hooks` in plugin
+agent frontmatter. Keep the installed CLI and plugin versions together, and
+verify the hooks in a fresh invocation before relying on enforcement.
+[Claude subagent reference](https://code.claude.com/docs/en/sub-agents#supported-frontmatter-fields),
+[hook reference](https://code.claude.com/docs/en/hooks#subagentstop).
 
 Both relay names are in the hook's loop guard, matched on the last segment
 of the agent name in any scope — a dispatch that already names a relay

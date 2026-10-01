@@ -150,11 +150,19 @@ Below a floor, the harness is excluded. OpenCode 2 versions before 2.0.21 and
 OpenCode major versions 3 and later are excluded rather than treated as drift.
 
 OpenCode uses separate native storage adapters for 1.x and 2.x.
-The OpenCode 2 chat runtime is a separate contribution.
-OpenCode 2 currently supports fresh pairs only. Retained OpenCode 1 identities
-and legacy or unrecognized sync positions are refused, including after native
-migration completes; start a fresh pair to use OpenCode 2. Verified retained
-history and cursor reconciliation is not implemented.
+Retained OpenCode 1 pairs require explicit `tandem migrate-opencode <pair-id>`
+reconciliation on OpenCode 2.0.21. Tandem uses native conversion, fork, export and
+import to prepare a fresh identity, verifies its historical prefix and session
+information, then commits the pair and every affected cursor atomically. Original
+identities and history remain recovery data; retries reuse the prepared identity.
+Readers validate both native content proof and committed pair ownership before
+admitting the historical prefix. New live turns still require native completion.
+
+Support covers closed, nonempty root histories. Completed checkpoints preserve
+native summary and recent context only when outgoing cursors have consumed the
+preceding archive. Native compacted tool outputs retain cleared-result markers.
+Pending work, unsupported attachments, parent/revert state, extra instructions
+and unverified loss refuse migration. `--dry-run` checks source shape only.
 
 Format knowledge is isolated per tool in `src/tandem/harness/claude_code.py`,
 `src/tandem/harness/codex.py`, `src/tandem/harness/opencode.py`, and

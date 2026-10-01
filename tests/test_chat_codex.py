@@ -961,3 +961,23 @@ def test_an_ask_mode_turn_after_a_review_resends_the_pre_review_policy(env, monk
         env.session, None, "go", "", rec.emit, rec)
     assert consulted == []
     assert env.params("thread/start") == {"cwd": env.session.cwd}
+
+
+def test_context_percentage_uses_last_call_instead_of_cumulative_usage():
+    rt = CodexRuntime(ChatConfig())
+    rec = Recorder()
+    rt._thread_id = "t"
+    total = {"totalTokens": 720000, "inputTokens": 700000, "cachedInputTokens": 0,
+             "outputTokens": 20000, "reasoningOutputTokens": 0}
+    last = {**total, "totalTokens": 120000, "inputTokens": 119000, "outputTokens": 1000}
+    rt.handle({"method": "thread/tokenUsage/updated", "params": {
+        "threadId": "t", "turnId": "u", "tokenUsage": {
+            "total": total, "last": last, "modelContextWindow": 240000}}},
+        lambda _: None, rec.emit, rec)
+    assert rt._usage == "50% ctx · 700000↑ 20000↓"
+    last["totalTokens"] = 2400                 # compaction shrinks the current context
+    rt.handle({"method": "thread/tokenUsage/updated", "params": {
+        "threadId": "t", "turnId": "u", "tokenUsage": {
+            "total": total, "last": last, "modelContextWindow": 240000}}},
+        lambda _: None, rec.emit, rec)
+    assert rt._usage == "1% ctx · 700000↑ 20000↓"

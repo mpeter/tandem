@@ -73,6 +73,10 @@ waits until the response finishes; press it again to cancel the switch.
 `tandem native` opens the first usable CLI in your configured order; use
 `tandem native --active codex` or `--active opencode` to choose another.
 
+When a native harness relies on a wired completion hook, a pending flip waits
+for its completion marker; transcript silence never ends a running tool call or approval wait.
+If the hook fails, cancel the switch or exit the native harness manually.
+
 ## What's new in 0.5
 
 **Rate-limit windows on the tab bar.** Every slot now shows its account's

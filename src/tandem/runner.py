@@ -103,28 +103,8 @@ def _mtime(path: Path | None) -> float:
         return 0.0
 
 
-# Quiescence means two different things depending on whether the
-# turn-complete marker was wired at launch, so it gets two constants.
-_QUIESCE_S = 2.0            # marker-less: the only turn-boundary signal there is
-_MISSED_MARKER_VALVE_S = 120.0
-"""Safety valve for a marker that was wired but never arrived — a hook that
-failed to run, a notify handler that died. NOT turn pacing: real turns go
-quiet for minutes at a time (a long tool call appends nothing between the
-tool_use line and the tool_result line — a full test suite, a slow install,
-a `sleep 90`), and firing there kills the harness mid-turn.
-
-The two error costs are wildly asymmetric, which is what sets the number.
-Firing too early costs a live turn: the harness is terminated between the
-tool call and its result, and that work is gone. Firing too late costs
-nothing but a wait, and only in the case this valve exists for at all — a
-dead hook — where a second Ctrl-] cancels the pending flip and the user can
-quit the harness by hand. So the valve sits far above any plausible
-tool-call silence rather than close to it. When the marker is wired it is
-the trigger; this is the last resort."""
-
-
-def _quiesce_default(marker_wired: bool) -> float:
-    return _MISSED_MARKER_VALVE_S if marker_wired else _QUIESCE_S
+# Transcript silence is a fallback only when no completion hook was wired.
+_QUIESCE_S = 2.0
 
 
 def _key_label(byte: int) -> str:
@@ -179,15 +159,16 @@ def wait_until_safe(
     Two modes, because transcript quiescence means different things:
 
     - `marker_wired=True` (the harness was launched with the turn-complete
-      hook — the common case): the marker touch is the only normal trigger.
-      Quiescence stays wired as a valve for a marker that never arrives,
-      never as a turn-pacing signal.
+      hook — the common case): an actual marker at least as new as the
+      transcript is required. Tool calls and approval waits can stay silent
+      indefinitely, so quiescence never releases a marker-wired wait.
     - `marker_wired=False` (no hook — e.g. codex with a user-configured
       notify handler tandem refuses to clobber): 2s of transcript quiescence
       is the fallback boundary, because nothing better exists.
 
-    `quiesce=None` takes the mode's default, so the mode alone is enough to
-    be safe; pass a number to override (tests scale it down).
+    `quiesce` controls only the marker-less fallback and defaults to 2s.
+    A failed completion hook leaves the flip armed until it is cancelled
+    or the user exits the harness manually.
 
     The transcript is re-read every poll through `provider`, because the path
     is not always known when the wait starts: codex mints its own session id
@@ -198,17 +179,12 @@ def wait_until_safe(
     An unknown transcript is *not* evidence of idleness. `_mtime(None)` is
     0.0, so the plain `s >= t` test would call every unknown-transcript
     session idle and fire a flip in the middle of a turn. With the marker
-    wired there is a better answer: nothing is known, so hold and let the
-    valve decide — anchored to the moment the wait began rather than to a
-    file mtime that does not exist. (Marker-less sessions keep the old
-    reading: quiescence is all they have, and their transcript is always
-    known — only codex's fresh-mint path arrives here with None, and that
-    path always wires the marker or falls back to the 2s quiescence over a
-    real file once discovery lands.)
+    wired, hold until discovery provides the transcript and a completion
+    marker closes its turn. A missing marker is not completion either, even
+    when the transcript path is known but no file has appeared yet.
 
-    Both clocks here are wall-clock on purpose: the deadline is derived from
-    file mtimes, so `time.time()` is the only comparable reading (monotonic
-    would be right for a pure timeout, but there is none in this loop).
+    File mtimes and the marker-less quiescence comparison use wall-clock
+    time so their readings are comparable.
 
     With `status_probe` (claude sessions), the probe is the entire
     boundary test and the marker/quiescence rules above never run: the
@@ -216,17 +192,14 @@ def wait_until_safe(
     running turn ("busy") from an idle prompt ("waiting") directly.
     Anything but "busy" — including no answer at all — flips
     immediately: single-tier by spec, eager on registry schema drift.
-    The valve is deliberately absent here; it existed to cap a marker
-    that never arrives, and it killed genuinely long turns. The
-    transcript-noise problem this solves: modern claude appends
+    The transcript-noise problem this solves: modern claude appends
     housekeeping (away_summary, last-prompt) minutes after Stop and
     bumps the transcript mtime on resume, so sentinel >= transcript is
     false while the session sits idle at its prompt."""
     if quiesce is None:
-        quiesce = _quiesce_default(marker_wired)
+        quiesce = _QUIESCE_S
     if provider is None:
         provider = lambda: transcript  # noqa: E731 - back-compat default
-    armed_at = time.time()
     while True:
         if cancelled():
             return False
@@ -236,16 +209,13 @@ def wait_until_safe(
                 continue
             return True
         path = provider()
-        if path is None and marker_wired:
-            if time.time() - armed_at >= quiesce:
-                return True   # valve, from arm time: no mtime to anchor to
-            time.sleep(poll)
-            continue
         t, s = _mtime(path), _mtime(sentinel)
-        if s >= t:
-            return True
-        if time.time() - t >= quiesce:
-            return True
+        if marker_wired:
+            if path is not None and s > 0 and s >= t:
+                return True
+        else:
+            if s >= t or time.time() - t >= quiesce:
+                return True
         time.sleep(poll)
 
 
@@ -294,7 +264,7 @@ class FlipMonitor:
         self.transcript = transcript
         self.sentinel = sentinel
         self.marker_wired = marker_wired
-        self.quiesce = _quiesce_default(marker_wired) if quiesce is None else quiesce
+        self.quiesce = _QUIESCE_S if quiesce is None else quiesce
         self.poll = poll
         self.status_probe = status_probe
         self.on_flip_decided = on_flip_decided
@@ -789,7 +759,7 @@ class InteractiveRunner:
                             path = found
                             # Publish to the flip monitor: until this lands it
                             # has no transcript to judge a turn boundary by,
-                            # and holds any armed flip behind its valve. A bare
+                            # and holds any armed flip until discovery. A bare
                             # attribute write is all the synchronization there
                             # is or should be — the GIL makes it atomic and the
                             # monitor's wait re-reads it every poll.

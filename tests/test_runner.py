@@ -124,12 +124,14 @@ def _touch(path, mtime):
     os.utime(path, (mtime, mtime))
 
 
-def test_wait_idle_when_sentinel_newer_than_transcript(tmp_path):
+@pytest.mark.parametrize("marker_wired", [False, True])
+def test_wait_idle_when_sentinel_newer_than_transcript(tmp_path, marker_wired):
     t, s = tmp_path / "t.jsonl", tmp_path / "s.turn"
     now = time.time()
     _touch(t, now - 10)
     _touch(s, now - 5)   # marker closed the last turn
-    assert wait_until_safe(t, s, cancelled=lambda: False) is True
+    assert wait_until_safe(t, s, cancelled=lambda: False,
+                           marker_wired=marker_wired) is True
 
 
 def test_wait_idle_when_no_files(tmp_path):
@@ -154,42 +156,47 @@ def test_wait_quiescence_fallback(tmp_path):
     )
 
 
-def test_wait_idle_when_no_files_wired(tmp_path):
-    # Fresh session: the harness has written nothing and the hook has not run
-    # yet, so 0 >= 0 reads idle in *both* modes. The flip must fire at once,
-    # not sit behind the wired mode's missed-marker valve.
-    assert (
-        wait_until_safe(tmp_path / "none", tmp_path / "none2",
-                        cancelled=lambda: False, marker_wired=True)
-        is True
-    )
+def test_wait_missing_marker_wired_does_not_infer_idle(tmp_path):
+    # No transcript or marker yet can also mean startup or pending approval.
+    polls = 0
+
+    def cancel():
+        nonlocal polls
+        polls += 1
+        return polls > 2
+
+    assert wait_until_safe(tmp_path / "none", tmp_path / "none2",
+                           cancelled=cancel, marker_wired=True, poll=0) is False
+    assert polls == 3
 
 
-def test_wait_wired_ignores_turn_pacing_quiet(tmp_path):
-    # With the marker wired, transcript quiet is NOT a turn boundary: a long
-    # tool call writes nothing between the tool_use append and the tool_result
-    # append, and firing there kills the harness mid-turn. quiesce is scaled
-    # down (1.0 stands in for the real 120s valve) to keep the test fast — the
-    # valve does eventually trip, it is just never the normal trigger.
+def test_wait_wired_long_tool_or_approval_wait_requires_marker(tmp_path):
     t, s = tmp_path / "t.jsonl", tmp_path / "s.turn"
-    _touch(t, time.time())         # turn in flight
-    _touch(s, time.time() - 30)    # marker live, but this turn is still open
+    _touch(t, time.time() - 3600)   # unfinished turn silent beyond the old valve
+    _touch(s, time.time() - 7200)   # only the previous turn completed
     done = threading.Event()
+    cancel = threading.Event()
     result = {}
 
     def waiter():
-        result["ok"] = wait_until_safe(t, s, cancelled=lambda: False,
-                                       quiesce=1.0, poll=0.05,
+        result["ok"] = wait_until_safe(t, s, cancelled=cancel.is_set,
+                                       quiesce=0.1, poll=0.05,
                                        marker_wired=True)
         done.set()
 
-    threading.Thread(target=waiter, daemon=True).start()
-    assert not done.wait(timeout=0.5)   # 0.5s of quiet: still waiting
-    assert done.wait(timeout=3)         # valve trips once quiesce elapses
-    assert result["ok"] is True
+    thread = threading.Thread(target=waiter, daemon=True)
+    thread.start()
+    try:
+        assert not done.wait(timeout=0.3)  # even an explicit timeout is ignored
+        _touch(s, time.time())            # completion, not silence, releases
+        assert done.wait(timeout=2)
+        assert result["ok"] is True
+    finally:
+        cancel.set()
+        thread.join(timeout=2)
 
 
-def test_wait_wired_default_quiesce_is_the_valve_not_2s(tmp_path):
+def test_wait_wired_default_ignores_quiescence(tmp_path):
     # The mode's whole point: the same 3s-quiet mid-turn transcript that the
     # marker-less mode calls idle must still be mid-turn when the marker is
     # wired, on default settings.
@@ -207,8 +214,8 @@ def test_wait_wired_default_quiesce_is_the_valve_not_2s(tmp_path):
         done.set()
 
     threading.Thread(target=waiter, daemon=True).start()
-    assert not done.wait(timeout=0.4)   # parked behind the 120s valve
-    cancel.set()                        # don't leave it parked for 120s
+    assert not done.wait(timeout=0.4)   # still waiting for completion
+    cancel.set()                        # cancellation remains available
     assert done.wait(timeout=2)
     assert result["ok"] is False
 
@@ -255,30 +262,32 @@ def test_wait_blocks_midturn_then_marker_releases(tmp_path):
 
 
 def test_wait_unknown_transcript_wired_is_not_read_as_idle(tmp_path):
-    # codex mints its own session id, so the flip monitor starts with no
-    # transcript at all. _mtime(None) is 0.0, which would make `s >= t` true
-    # against any sentinel and fire the flip instantly — mid-turn. No
-    # evidence is not idleness: hold, and let the valve decide.
+    # A previous marker cannot prove completion before rollout discovery.
     s = tmp_path / "s.turn"
-    _touch(s, time.time() - 30)      # a previous turn's marker exists
-    done = threading.Event()
+    _touch(s, time.time() - 30)
+    cancel, done = threading.Event(), threading.Event()
     result = {}
 
     def waiter():
-        result["ok"] = wait_until_safe(None, s, cancelled=lambda: False,
-                                       quiesce=1.0, poll=0.05,
+        result["ok"] = wait_until_safe(None, s, cancelled=cancel.is_set,
+                                       quiesce=0.1, poll=0.05,
                                        marker_wired=True)
         done.set()
 
-    threading.Thread(target=waiter, daemon=True).start()
-    assert not done.wait(timeout=0.5)   # did NOT fire instantly
-    assert done.wait(timeout=3)         # valve, anchored to arm time
-    assert result["ok"] is True
+    thread = threading.Thread(target=waiter, daemon=True)
+    thread.start()
+    try:
+        assert not done.wait(timeout=0.3)
+    finally:
+        cancel.set()
+        thread.join(timeout=2)
+    assert done.is_set()
+    assert result["ok"] is False
 
 
 def test_wait_provider_publishing_a_path_restores_normal_rules(tmp_path):
     # The tail thread discovers the rollout mid-wait and publishes it; from
-    # that poll on the ordinary marker/quiescence rules apply.
+    # that poll on the ordinary completion-marker rule applies.
     t, s = tmp_path / "t.jsonl", tmp_path / "s.turn"
     _touch(s, time.time() - 30)
     published: list = [None]
@@ -487,7 +496,8 @@ def test_monitor_toggle_cancels(tmp_path):
     _touch(t, time.time())           # mid-turn: monitor will block
     _touch(s, time.time() - 30)
     control = _StubControl()
-    m = FlipMonitor(control, [b"\x04"], transcript=t, sentinel=s)
+    m = FlipMonitor(control, [b"\x04"], transcript=t, sentinel=s,
+                    marker_wired=True, poll=0.05)
     m.start()
     m.flip_pressed()
     time.sleep(0.1)
@@ -508,19 +518,35 @@ def test_monitor_stop_unblocks_cleanly(tmp_path):
     assert m.flip_requested is False
 
 
-def test_monitor_quiesce_defaults_by_mode(tmp_path):
+def test_monitor_stop_cancels_armed_marker_wait(tmp_path):
+    # Manual harness exit stops the monitor without terminating it again.
+    t, s = tmp_path / "t.jsonl", tmp_path / "s.turn"
+    _touch(t, time.time() - 3600)
+    control = _StubControl()
+    m = FlipMonitor(control, [b"\x04"], transcript=t, sentinel=s,
+                    marker_wired=True, poll=0.05)
+    m.start()
+    m.flip_pressed()
+    try:
+        time.sleep(0.1)
+        assert m.armed() is True
+        assert m.flip_requested is False
+    finally:
+        m.stop()
+    assert not m._thread.is_alive()
+    assert m.flip_requested is False
+    assert control.calls == []
+
+
+def test_monitor_quiesce_default_and_override(tmp_path):
     s = tmp_path / "s.turn"
     unwired = FlipMonitor(_StubControl(), [], None, s)
     wired = FlipMonitor(_StubControl(), [], None, s, marker_wired=True)
     override = FlipMonitor(_StubControl(), [], None, s, marker_wired=True,
                            quiesce=1.5)
     assert unwired.quiesce == 2.0        # marker-less fallback
-    assert wired.quiesce == 120.0        # missed-marker valve, not turn pacing
+    assert wired.quiesce == 2.0          # ignored when marker is wired
     assert override.quiesce == 1.5       # explicit injection wins
-    # The valve has to outlast the longest silence a real turn can produce (a
-    # full test suite between the tool_use and tool_result appends), because
-    # firing early kills that turn while firing late only costs a wait.
-    assert wired.quiesce > 60.0
 
 
 def test_monitor_passes_mode_through_to_wait(tmp_path, monkeypatch):
@@ -544,7 +570,7 @@ def test_monitor_passes_mode_through_to_wait(tmp_path, monkeypatch):
         time.sleep(0.05)
     m.stop()
     assert m.flip_requested is True
-    assert seen == {"quiesce": 120.0, "poll": 0.05, "marker_wired": True,
+    assert seen == {"quiesce": 2.0, "poll": 0.05, "marker_wired": True,
                     "provider_reads": None}
 
 
@@ -826,7 +852,7 @@ def test_session_status_tolerates_garbage_files(tmp_path, monkeypatch):
 
 def test_wait_probe_waiting_overrides_busy_mtimes(tmp_path):
     # transcript newer than sentinel: the mtime rules read mid-turn and
-    # would hold for the 120s valve. The probe says the session is at its
+    # would hold for completion. The probe says the session is at its
     # prompt, and the probe is the whole test now.
     t, s = tmp_path / "t.jsonl", tmp_path / "s.turn"
     _touch(t, time.time())

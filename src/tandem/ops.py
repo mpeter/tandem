@@ -302,6 +302,8 @@ def adopt_native_id(store: StateStore, session: PairedSession, harness: str,
     if harness == "opencode":
         _preflight_storage(store, replace(
             session, native_session_ids={**session.native_session_ids, harness: native_id},
+            # The current pair was checked above; this identity is prospective.
+            state_db=None,
         ))
     store.set_native_session_id(session.tandem_id, harness, native_id)
     session = store.get_session(session.tandem_id) or session

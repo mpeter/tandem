@@ -23,6 +23,7 @@ import secrets
 import sqlite3
 import subprocess
 import time
+from contextlib import closing
 from pathlib import Path
 from typing import Any
 
@@ -188,7 +189,7 @@ class OpencodeTurnReader:
 
         pos = self.cursor.pending.get("source_pos") or {"time": 0, "id": ""}
         out = []
-        with connect(self.db) as conn:
+        with closing(connect(self.db)) as conn, conn:
             rows = conn.execute(
                 _AFTER_POS_SQL,
                 (self.session_id, pos["time"], pos["time"], pos["id"]),

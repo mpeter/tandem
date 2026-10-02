@@ -6,6 +6,7 @@ import json
 import os
 import re
 import shutil
+import subprocess
 import sqlite3
 import sys
 import time
@@ -374,6 +375,29 @@ def _seed_shadows(store: StateStore, session: PairedSession) -> None:
                                   hid if hid != active else session.next_active(active))
         cursor.pending["harness_state"] = ctx.harness_state
         store.save_cursor(cursor)
+
+
+@main.command(name="migrate-opencode")
+@click.argument("pair_id")
+@click.option("--dry-run", is_flag=True, help="Inspect eligibility without native calls or pair changes.")
+def migrate_opencode_command(pair_id: str, dry_run: bool) -> None:
+    """Copy closed retained history to a fresh native identity and rebind PAIR_ID.
+
+    Close the selected native CLI/chat first. The old identity remains recovery
+    history. Retries reuse the exact prepared identity; conflicts stay unbound.
+    """
+    from .harness.opencode import db_path
+    from .opencode_migration import migrate_opencode
+
+    try:
+        db = db_path()
+        if db is None:
+            raise ValueError("OpenCode database is unavailable")
+        with StateStore() as store:
+            result = migrate_opencode(store, pair_id, db, dry_run=dry_run)
+        click.echo(json.dumps(result, sort_keys=True))
+    except (ValueError, OSError, subprocess.TimeoutExpired) as exc:
+        raise click.ClickException(str(exc)) from exc
 
 
 @main.command()

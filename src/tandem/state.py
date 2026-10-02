@@ -18,6 +18,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from . import paths
+from .opencode_binding import digest
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS sessions (
@@ -56,6 +57,11 @@ CREATE TABLE IF NOT EXISTS chat_history (
     ts TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS chat_history_cwd ON chat_history (cwd, id);
+CREATE TABLE IF NOT EXISTS opencode_reconciliations (
+    tandem_id TEXT PRIMARY KEY,
+    phase TEXT NOT NULL,
+    record TEXT NOT NULL
+);
 """
 
 
@@ -73,6 +79,8 @@ class PairedSession:
     created_at: str
     last_sync_at: str | None
     last_used_at: str | None = None
+    opencode_reconciliation: dict | None = None
+    state_db: Path | None = field(default=None, repr=False, compare=False)
 
     def native_id(self, harness: str) -> str | None:
         return self.native_session_ids.get(harness)
@@ -171,6 +179,7 @@ class StateStore:
         )
 
     def _row_to_session(self, row: sqlite3.Row) -> PairedSession:
+        reconciliation = self.get_opencode_reconciliation(row["tandem_id"])
         return PairedSession(
             tandem_id=row["tandem_id"],
             cwd=row["cwd"],
@@ -180,6 +189,9 @@ class StateStore:
             created_at=row["created_at"],
             last_sync_at=row["last_sync_at"],
             last_used_at=row["last_used_at"],
+            opencode_reconciliation=(reconciliation if reconciliation and
+                                     reconciliation["phase"] == "committed" else None),
+            state_db=self.db_path,
         )
 
     def get_session(self, tandem_id: str) -> PairedSession | None:
@@ -220,7 +232,7 @@ class StateStore:
         keyed on it. The native session files are not this store's to remove:
         the caller only drops sessions that never got any."""
         with self._tx():
-            for table in ("sync_cursors", "chat_pins", "sessions"):
+            for table in ("sync_cursors", "chat_pins", "opencode_reconciliations", "sessions"):
                 self._conn.execute(f"DELETE FROM {table} WHERE tandem_id = ?", (tandem_id,))
 
     def touch_used(self, tandem_id: str) -> None:
@@ -298,6 +310,80 @@ class StateStore:
             )
 
     # -- chat model pins -----------------------------------------------------
+
+    def get_opencode_reconciliation(self, tandem_id: str) -> dict | None:
+        row = self._conn.execute(
+            "SELECT phase, record FROM opencode_reconciliations WHERE tandem_id=?",
+            (tandem_id,),
+        ).fetchone()
+        return {**json.loads(row["record"]), "phase": row["phase"]} if row else None
+
+    def _check_opencode_pair(self, tandem_id: str, record: dict) -> None:
+        session = self.get_session(tandem_id)
+        if session is None or session.native_session_ids != record["original_ids"]:
+            raise ValueError("Pair changed; prepared OpenCode import remains unbound")
+        pair = {"participants": session.participants, "cwd": session.cwd, "active": session.active}
+        if pair != record["original_pair"]:
+            raise ValueError("Pair membership or context changed; prepared import remains unbound")
+        directions = [list(row) for row in self._conn.execute(
+            "SELECT source,target FROM sync_cursors WHERE tandem_id=? "
+            "AND (source='opencode' OR target='opencode') ORDER BY source,target", (tandem_id,))]
+        if directions != record["cursor_directions"]:
+            raise ValueError("Sync direction set changed; prepared import remains unbound")
+
+    def prepare_opencode_reconciliation(self, tandem_id: str, record: dict) -> None:
+        """Persist the complete fixed-ID native payload before importing it."""
+        from dataclasses import asdict
+
+        self.db_path.chmod(0o600)
+        with self._tx() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            if self.get_opencode_reconciliation(tandem_id) is not None:
+                raise ValueError("OpenCode reconciliation already exists; resume its prepared import")
+            self._check_opencode_pair(tandem_id, record)
+            for expected in record["original_cursors"]:
+                current = self.get_cursor(tandem_id, expected["source"], expected["target"])
+                if digest(asdict(current)) != digest(expected):
+                    raise ValueError("Sync cursor changed while planning OpenCode reconciliation")
+            conn.execute(
+                "INSERT INTO opencode_reconciliations VALUES (?, 'prepared', ?)",
+                (tandem_id, json.dumps(record)),
+            )
+
+    def commit_opencode_reconciliation(self, tandem_id: str) -> None:
+        """Compare and swap the binding and every direction in one transaction."""
+        from dataclasses import asdict
+
+        with self._tx() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            record = self.get_opencode_reconciliation(tandem_id)
+            if record is None:
+                raise ValueError("OpenCode reconciliation was not prepared")
+            if record["phase"] == "committed":
+                return
+            if record["phase"] != "prepared":
+                raise ValueError("Unknown OpenCode reconciliation phase")
+            self._check_opencode_pair(tandem_id, record)
+            for expected in record["original_cursors"]:
+                if digest(asdict(self.get_cursor(tandem_id, expected["source"], expected["target"]))) != digest(expected):
+                    raise ValueError("Sync cursor changed; prepared OpenCode import remains unbound")
+            ids = {**record["original_ids"], "opencode": record["fresh_id"]}
+            conn.execute("UPDATE sessions SET native_session_ids=? WHERE tandem_id=?",
+                         (json.dumps(ids), tandem_id))
+            for translated in record["translated_cursors"]:
+                cursor = SyncCursor(**translated)
+                conn.execute(
+                    "INSERT INTO sync_cursors VALUES (?,?,?,?,?,?,?,?,?) "
+                    "ON CONFLICT(tandem_id,source,target) DO UPDATE SET "
+                    "byte_offset=excluded.byte_offset,line_index=excluded.line_index,"
+                    "turn_index=excluded.turn_index,pending=excluded.pending,"
+                    "failed_turns=excluded.failed_turns,updated_at=excluded.updated_at",
+                    (tandem_id, cursor.source, cursor.target, cursor.byte_offset,
+                     cursor.line_index, cursor.turn_index, json.dumps(cursor.pending),
+                     cursor.failed_turns, _now()),
+                )
+            conn.execute("UPDATE opencode_reconciliations SET phase='committed' WHERE tandem_id=?",
+                         (tandem_id,))
 
     def get_pin(self, tandem_id: str, harness: str) -> str:
         """The model pinned for `harness` in the chat window, "" for none."""

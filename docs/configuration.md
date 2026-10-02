@@ -29,6 +29,18 @@ sessions on a machine that also has opencode. Unknown names are
 dropped, duplicates deduped, and anything else malformed falls back to
 all three. Sessions already paired keep their own participant list.
 
+Retained OpenCode 1 pairs require explicit reconciliation on OpenCode 2.0.21:
+`tandem migrate-opencode <pair-id>` creates a verified fresh native identity and
+atomically updates the pair and its sync cursors. Original history remains
+available for recovery. `--dry-run` checks source shape without native conversion.
+
+The initial scope is closed, nonempty root histories. Completed checkpoints are
+supported when outgoing cursors have consumed the preceding archive; native
+summary and recent context remain active, and compacted tool outputs stay cleared.
+Pending work, unsupported attachments, parent/revert state, extra instructions
+and unverified loss refuse migration. Unreconciled retained identities and
+unrecognized sync positions remain refused rather than replayed.
+
 ## skip_permissions — no permission prompts in claude and codex
 
 A top-level switch, off by default. When on, every claude and codex

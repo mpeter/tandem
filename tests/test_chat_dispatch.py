@@ -705,18 +705,21 @@ class TestClose:
         the worker. A close() that answers only the first leaves the worker
         parked on the second for the whole join timeout, and the store then
         closes under it."""
-        from tandem.chat.events import QuestionRequest
+        from tandem.chat.events import QuestionCancelled, QuestionRequest
         from tandem.chat.window import WindowAnswers
 
         env = env_factory(active="claude")
-        answered = []
+        answered, cancelled = [], []
 
         class AsksTwice:
             harness = "claude"
 
             def run_turn(self, session, native_id, prompt, model, emit, answers, command=""):
                 for q in ("one?", "two?"):
-                    answered.append(answers.answer(QuestionRequest(q, ())))
+                    try:
+                        answered.append(answers.answer(QuestionRequest(q, ())))
+                    except QuestionCancelled:
+                        cancelled.append(q)
                 emit(TurnFinished("interrupted", ""))
                 return TurnOutcome("interrupted")
 
@@ -733,8 +736,12 @@ class TestClose:
         started = time.monotonic()
         d.close()
         assert time.monotonic() - started < 5.0
-        assert answered == ["", ""]
+        assert answered == []
+        assert cancelled == ["one?", "two?"]
+        assert len(posted) == 1
+        assert TurnFinished("interrupted", "") in events
         assert not d._thread.is_alive()
+        env.store.close()
 
 
 class TestFreshlyPairedSession:
@@ -1511,3 +1518,70 @@ def test_a_structured_output_tool_call_is_the_verdict_and_never_painted(env_fact
         assert [v.verdict for v in nav.settled] == ["speak"]
     finally:
         d.close()
+
+
+def test_first_codex_question_cancel_adopts_native_id_and_syncs_partial_turn(env_factory, monkeypatch, tmp_path):
+    import sys
+    from pathlib import Path
+
+    from tandem.chat.runtime.codex import CodexRuntime
+    from tandem.chat.window import WindowAnswers
+    from tandem.config import ChatConfig
+    from tandem.events import SessionContext
+
+    env = env_factory(active="codex", seed_active=False)
+    monkeypatch.setenv("FAKE_CODEX_SCENARIO", "question")
+    monkeypatch.setenv("FAKE_REPLY_OUT", str(tmp_path / "reply.json"))
+    events, outcomes, questions = [], [], []
+    runtime = CodexRuntime(ChatConfig(), binary=[sys.executable, str(Path(__file__).parent / "fakes" / "fake_codex_appserver.py")])
+    run = runtime.run_turn
+    spawn = runtime._spawn
+    children = []
+
+    def capture_process(*args, **kwargs):
+        child = spawn(*args, **kwargs)
+        children.append(child[0])
+        return child
+
+    monkeypatch.setattr(runtime, "_spawn", capture_process)
+
+    def capture(*args, **kwargs):
+        outcome = run(*args, **kwargs)
+        outcomes.append(outcome)
+        return outcome
+
+    monkeypatch.setattr(runtime, "run_turn", capture)
+
+    def cancel_question(request):
+        questions.append(request)
+        ctx = SessionContext(tandem_id=env.session.tandem_id, cwd=env.cwd,
+                             direction="claude->codex", target_session_id="thread-new")
+        rollout = get_adapter("codex").create_shadow_transcript(env.cwd, "thread-new", ctx, "seed")
+        for entry in codex_turn("ask", "unused")[:2]:
+            write_line(rollout, entry)
+        answers.cancel_question()
+
+    answers = WindowAnswers(cancel_question)
+    dispatcher = Dispatcher(env.store, env.session, {"codex": runtime}, events.append, answers)
+    try:
+        assert dispatcher.submit("ask") == ""
+        wait_idle(events)
+        assert len(questions) == 1
+        assert len(outcomes) == 1
+        assert outcomes[0].status == "interrupted" and outcomes[0].native_id == "thread-new"
+        assert env.store.get_session(env.session.tandem_id).native_id("codex") == "thread-new"
+        assert env.store.get_cursor(env.session.tandem_id, "codex", "claude").line_index > 0
+        texts = claude_texts(env.claude_shadow)
+        assert "[via codex] ask" in texts
+        assert "[tandem] the turn on codex ended: interrupted" in texts
+        assert not (tmp_path / "reply.json").exists()
+        assert [e for e in events if isinstance(e, TurnFinished)] == [TurnFinished("interrupted", "")]
+        assert not any(isinstance(e, Failure) for e in events)
+        assert runtime._proc is None
+    finally:
+        dispatcher.close()
+        env.store.close()
+        for child in children:
+            for pipe in (child.stdin, child.stdout, child.stderr):
+                if pipe is not None:
+                    pipe.close()

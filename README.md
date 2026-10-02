@@ -81,9 +81,16 @@ silence never ends a running tool call or approval wait. If completion cannot be
 confirmed, cancel the switch or exit the native harness manually.
 
 OpenCode has separate adapters for **1.18+** and **2.0.21+**. OpenCode 2 uses
-its native session import and settled transcript format. Newer major versions
-remain excluded until verified. Its native interface supports fresh pairs;
-chat requires the OpenCode 2 chat runtime, which is not yet enabled.
+its native session import, settled transcript format, authenticated HTTP API,
+and execution events. Fresh pairs support both the native interface and chat.
+Newer major versions remain excluded until verified.
+
+Chat command discovery depends on the activation barrier in OpenCode 2.0.21's
+authenticated `GET /api/integration` handler (source revision
+`8a8bd622a3d7dc29ccf30ec17f84e363ed95ed72`). Tandem waits for that handler before
+reading the command catalog each turn. If the barrier fails, the turn is refused
+before input admission; an unknown slash command is sent literally only after
+the catalog settles.
 
 Retained OpenCode 1 sessions remain unsupported even after native migration
 completes: their converted history and sync cursors need verified reconciliation.

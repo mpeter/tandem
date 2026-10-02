@@ -10,4 +10,11 @@ _CLASSES = {"claude": ClaudeRuntime, "codex": CodexRuntime, "opencode": Opencode
 
 
 def make_runtimes(session, cfg) -> dict:
-    return {h: _CLASSES[h](cfg) for h in session.participants if h in _CLASSES}
+    from ... import compat
+
+    classes = dict(_CLASSES)
+    if "opencode" in session.participants and compat.opencode_major() == 2:
+        from .opencode2 import Opencode2Runtime
+
+        classes["opencode"] = Opencode2Runtime
+    return {h: classes[h](cfg) for h in session.participants if h in classes}

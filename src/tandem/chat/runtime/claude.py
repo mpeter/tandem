@@ -34,7 +34,7 @@ from ... import modelcat
 from ...harness import get_adapter
 from ...ratelimit import format_windows, parse_claude_event
 from ..commands import Command
-from ..events import (Answers, ApprovalRequest, FileDiff, LimitsUpdate, LiveEvent, QuestionRequest,
+from ..events import (Answers, ApprovalRequest, FileDiff, LimitsUpdate, LiveEvent, QuestionCancelled, QuestionRequest,
                       TextDelta, ThinkingDelta, ToolFinished, ToolOutput, ToolStarted, TurnFinished,
                       TurnOutcome)
 from . import child_env, first_line, summarize_args, terminate
@@ -336,6 +336,10 @@ class ClaudeRuntime:
                 outcome = self.handle_line(m, emit, answers, send)
                 if outcome is not None:
                     break
+        except QuestionCancelled:
+            self.interrupt()
+            outcome = TurnOutcome("interrupted")
+            emit(TurnFinished("interrupted", ""))
         finally:
             terminate(proc, soft=lambda: proc.stdin.close(), soft_timeout=3.0)
             reader.join(2.0)        # the tail below must be the whole of stderr

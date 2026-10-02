@@ -162,10 +162,14 @@ LiveEvent = Union[TextDelta, ThinkingDelta, ToolStarted, ToolOutput, ToolFinishe
 STATUSES = ("completed", "interrupted", "failed")
 
 
+class QuestionCancelled(Exception):
+    """The user dismissed a question without supplying an answer."""
+
+
 class Answers(Protocol):
     def approve(self, req: ApprovalRequest) -> str: ...   # one of req.choices
 
-    def answer(self, req: QuestionRequest) -> str: ...
+    def answer(self, req: QuestionRequest) -> str: ...   # raises QuestionCancelled on dismissal
 
 
 @dataclass

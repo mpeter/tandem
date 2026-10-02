@@ -474,3 +474,150 @@ class TestRelocatedClaudeTranscript:
         self._relocate(env)
         ops.prepare_turn(env.store, env.session, "codex")
         assert not env.claude_shadow.exists()
+
+
+@pytest.mark.parametrize("operation", ["prepare", "switch", "drain", "fast_forward", "adopt", "after"])
+@pytest.mark.parametrize("active", ["opencode", "claude"])
+@pytest.mark.parametrize("unsafe", ["retained", "legacy_cursor", "unknown_cursor", "missing_position", "unavailable_db"])
+def test_opencode_containment_precedes_native_and_state_writes(
+    tmp_path, monkeypatch, operation, active, unsafe,
+):
+    import sqlite3
+    from contextlib import closing
+
+    from conftest import Env3
+    from tandem.harness import opencode2 as oc
+
+    env = Env3(tmp_path, monkeypatch)
+    try:
+        env.store.set_active(env.session.tandem_id, active)
+        env.store.set_native_session_id(env.session.tandem_id, "codex", None)
+        env.session = env.refresh()
+        db = tmp_path / "native.db"
+        with closing(sqlite3.connect(db)) as conn, conn:
+            conn.execute("CREATE TABLE session (id TEXT PRIMARY KEY)")
+            if unsafe == "retained":
+                conn.execute("INSERT INTO session VALUES (?)", (env.session.native_id("opencode"),))
+        if unsafe not in ("retained", "unavailable_db"):
+            # The second outgoing direction must be checked even when it
+            # isn't the active drain's first target.
+            cursor = env.store.get_cursor(env.session.tandem_id, "opencode", "codex")
+            cursor.pending = {"source_pos": {
+                "legacy_cursor": {"time": 1, "id": "msg_old"},
+                "unknown_cursor": {"offset": 1},
+                "missing_position": {},
+            }[unsafe]}
+            cursor.line_index = 1
+            env.store.save_cursor(cursor)
+        native_before = db.read_bytes()
+        state_before = list(env.store._conn.iterdump())
+        original_get_adapter = ops.get_adapter
+        monkeypatch.setattr(oc, "db_path", lambda: None if unsafe == "unavailable_db" else db)
+        monkeypatch.setattr(ops, "get_adapter", lambda name: (
+            oc.Opencode2Adapter() if name == "opencode" else original_get_adapter(name)
+        ))
+        writes = []
+
+        def forbidden(*args, **kwargs):
+            writes.append((args, kwargs))
+            pytest.fail("containment allowed a native or state write")
+
+        for name in ("_create_codex_shadow_late", "_create_claude_shadow_late", "_run"):
+            monkeypatch.setattr(ops, name, forbidden)
+        for name in ("set_native_session_id", "save_cursor", "set_active"):
+            monkeypatch.setattr(env.store, name, forbidden)
+        actions = {
+            "prepare": lambda: ops.prepare_turn(env.store, env.session, "claude"),
+            "switch": lambda: ops.switch_session(env.store, env.session, to="codex"),
+            "drain": lambda: ops.drain_source(env.store, env.session, "claude"),
+            "fast_forward": lambda: ops.fast_forward_all(env.store, env.session, "claude"),
+            "adopt": lambda: ops.adopt_native_id(env.store, env.session, "codex", "new-id"),
+            "after": lambda: ops.sync_after_turn(env.store, env.session, "claude"),
+        }
+        error = ValueError if unsafe == "unavailable_db" else oc.LegacySessionUnsupported
+        with pytest.raises(error):
+            actions[operation]()
+        assert writes == []
+        assert db.read_bytes() == native_before
+        assert list(env.store._conn.iterdump()) == state_before
+        assert env.store.get_session(env.session.tandem_id).native_id("codex") is None
+    finally:
+        env.store.close()
+
+
+def test_fresh_opencode_preflight_allows_late_seed_while_native_source_is_busy(
+    tmp_path, monkeypatch,
+):
+    import sqlite3
+    from contextlib import closing
+
+    from conftest import Env3
+    from tandem.harness import opencode2 as oc
+
+    env = Env3(tmp_path, monkeypatch)
+    try:
+        env.store.set_native_session_id(env.session.tandem_id, "codex", None)
+        env.session = env.refresh()
+        db = tmp_path / "native.db"
+        with closing(sqlite3.connect(db)) as conn, conn:
+            conn.execute("CREATE TABLE session (id TEXT PRIMARY KEY)")
+            conn.execute("INSERT INTO session VALUES ('different-retained-session')")
+            conn.execute("CREATE TABLE session_v2 (id TEXT PRIMARY KEY, time_suspended INTEGER)")
+            conn.execute("INSERT INTO session_v2 VALUES (?, 123)", (env.session.native_id("opencode"),))
+        monkeypatch.setattr(oc, "db_path", lambda: db)
+        fake = ops.get_adapter("opencode")
+        monkeypatch.setattr(fake, "preflight_session", oc.Opencode2Adapter().preflight_session, raising=False)
+        cursor = env.store.get_cursor(env.session.tandem_id, "opencode", "codex")
+        cursor.pending = {"source_pos": {"seq": 0}}
+        cursor.line_index = 1
+        env.store.save_cursor(cursor)
+        native_before = db.read_bytes()
+
+        refreshed = ops.prepare_turn(env.store, env.session, "claude")
+
+        assert refreshed.native_id("codex")
+        assert env.store.get_session(env.session.tandem_id).native_id("codex")
+        assert db.read_bytes() == native_before
+        assert env.store.get_cursor(env.session.tandem_id, "opencode", "codex").pending == cursor.pending
+    finally:
+        env.store.close()
+
+
+@pytest.mark.parametrize("retained", [True, False])
+def test_adopt_opencode_preflights_incoming_identity(tmp_path, monkeypatch, retained):
+    import sqlite3
+    from contextlib import closing
+
+    from conftest import Env3
+    from tandem.harness import opencode2 as oc
+
+    env = Env3(tmp_path, monkeypatch)
+    try:
+        env.store.set_native_session_id(env.session.tandem_id, "opencode", None)
+        env.session = env.refresh()
+        db = tmp_path / "native.db"
+        with closing(sqlite3.connect(db)) as conn, conn:
+            conn.execute("CREATE TABLE session (id TEXT PRIMARY KEY)")
+            if retained:
+                conn.execute("INSERT INTO session VALUES ('incoming')")
+        original_get_adapter = ops.get_adapter
+        monkeypatch.setattr(oc, "db_path", lambda: db)
+        monkeypatch.setattr(ops, "get_adapter", lambda name: (
+            oc.Opencode2Adapter() if name == "opencode" else original_get_adapter(name)
+        ))
+        native_before = db.read_bytes()
+        state_before = list(env.store._conn.iterdump())
+        if retained:
+            def forbidden(*args, **kwargs):
+                pytest.fail("incoming retained identity allowed a state write")
+            for name in ("set_native_session_id", "save_cursor"):
+                monkeypatch.setattr(env.store, name, forbidden)
+            with pytest.raises(oc.LegacySessionUnsupported):
+                ops.adopt_native_id(env.store, env.session, "opencode", "incoming")
+            assert list(env.store._conn.iterdump()) == state_before
+        else:
+            refreshed = ops.adopt_native_id(env.store, env.session, "opencode", "incoming")
+            assert refreshed.native_id("opencode") == "incoming"
+        assert db.read_bytes() == native_before
+    finally:
+        env.store.close()

@@ -119,17 +119,21 @@ def _reset_db_cache() -> None:
 
 
 def db_path() -> Path | None:
-    """Opencode's DB. $OPENCODE_DB (opencode's own override flag) wins; else
-    `opencode db path` once per process. None on ANY failure — discovery
-    fails closed (the adapter is dropped from the usable set), never a
-    guessed default path (the filename is channel-suffixed)."""
+    """Discover the installed version's DB, honoring $OPENCODE_DB.
+    None on any discovery failure — never guess the channel-suffixed path."""
+    version = compat.detect_cli_version("opencode")
+    if version and compat.hard_rejection_reason("opencode", version):
+        return None
     env = os.environ.get("OPENCODE_DB")
     if env:
         return Path(env)
     if "path" in _db_cache:
         return _db_cache["path"]
     try:
-        out = _run(["opencode", "db", "path"], capture_output=True, text=True,
+        parsed = compat.parse_version(version or "")
+        command = (["opencode", "debug", "paths", "db"]
+                   if parsed and parsed[0] == 2 else ["opencode", "db", "path"])
+        out = _run(command, capture_output=True, text=True,
                    timeout=20)
         line = out.stdout.strip().splitlines()[-1] if out.returncode == 0 and \
             out.stdout.strip() else ""
@@ -241,6 +245,11 @@ class OpencodeAdapter(HarnessAdapter):
         return compat.version_supported("opencode", version_text)
 
     def runtime_ready(self) -> tuple[bool, str]:
+        version = self.detect_version()
+        reason = (compat.hard_rejection_reason("opencode", version)
+                  if version else None)
+        if reason is not None:
+            return False, reason
         db = db_path()
         if db is None:
             return False, "database not discoverable (`opencode db path` failed)"
@@ -248,6 +257,8 @@ class OpencodeAdapter(HarnessAdapter):
             with connect(db) as conn:
                 names = {r[0] for r in conn.execute(
                     "SELECT name FROM sqlite_master WHERE type='table'")}
+                if "session_v2" in names:
+                    return False, "OpenCode 2 database requires the v2 adapter"
                 missing = {"session", "message", "part"} - names
                 if missing:
                     return False, f"expected table(s) missing: {sorted(missing)}"

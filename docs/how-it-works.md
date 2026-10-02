@@ -141,7 +141,8 @@ tandem pins what it was built against (observed formats documented in
 | --- | --- | --- |
 | Claude Code | 2.1.261 | ≥ 2.0, < 3 |
 | Codex CLI | 0.153.4 | ≥ 0.140, < 0.160 |
-| opencode | 1.18.15 | ≥ 1.18 (no ceiling) |
+| OpenCode 1 | 1.18.20 | ≥ 1.18, < 2 |
+| OpenCode 2 | 2.0.21 | ≥ 2.0.21, < 3 |
 
 These ranges cover session-format compatibility. Codex profile-dependent chat
 modes and reviews additionally require the experimental permission-profile APIs
@@ -149,12 +150,20 @@ described in [configuration](configuration.md#chat--the-unified-window). Their e
 CLI version has not been established; API availability was checked on 0.159.3.
 
 Above a range's ceiling, tandem warns and asks you to run `tandem doctor`
-before trusting sync; below the floor the harness is excluded from the
-session (the format genuinely predates what tandem was built on).
-opencode has a floor only, because pre-1.18 opencode predates its SQLite
-session storage. Format knowledge is isolated per tool in
-`src/tandem/harness/claude_code.py`, `src/tandem/harness/codex.py`, and
-`src/tandem/harness/opencode.py`.
+before trusting sync, unless the version is known incompatible and excluded.
+Below a floor, the harness is excluded. OpenCode 2 versions before 2.0.21 and
+OpenCode major versions 3 and later are excluded rather than treated as drift.
+
+OpenCode uses separate native storage adapters for 1.x and 2.x.
+The OpenCode 2 chat runtime is a separate contribution.
+OpenCode 2 currently supports fresh pairs only. Retained OpenCode 1 identities
+and legacy or unrecognized sync positions are refused, including after native
+migration completes; start a fresh pair to use OpenCode 2. Verified retained
+history and cursor reconciliation is not implemented.
+
+Format knowledge is isolated per tool in `src/tandem/harness/claude_code.py`,
+`src/tandem/harness/codex.py`, `src/tandem/harness/opencode.py`, and
+`src/tandem/harness/opencode2.py`.
 
 ## Where your data lives
 

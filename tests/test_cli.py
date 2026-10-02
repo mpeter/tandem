@@ -1209,6 +1209,26 @@ def test_group_no_review_reaches_a_resumed_window(homes, ok_versions, chat_cfgs)
     assert [c.navigator for c in chat_cfgs] == [""]
 
 
+def test_future_opencode_resume_preserves_three_way_session(homes, chatted, monkeypatch):
+    monkeypatch.setattr(cli, "_resolve_participants",
+                        lambda warn_only=False: (["claude", "codex"],
+                                                 {"claude": "2.1.284", "codex": "0.159.3",
+                                                  "opencode": "3.0.0"}))
+    members = ["claude", "codex", "opencode"]
+    native_ids = {"claude": "c-9", "codex": "x-9", "opencode": "o-9"}
+    with StateStore() as store:
+        old = store.create_session(str(homes), "opencode", members, native_ids)
+    result = click.testing.CliRunner().invoke(cli.main, ["resume", old.tandem_id])
+    assert result.exit_code == 1
+    assert "OpenCode 3 is unsupported" in result.output
+    assert chatted == []
+    with StateStore() as store:
+        saved = store.get_session(old.tandem_id)
+    assert saved.participants == members
+    assert saved.active == "opencode"
+    assert {h: saved.native_id(h) for h in members} == native_ids
+
+
 def test_review_flag_falls_back_to_claude_when_opencode_executes(homes, chat_cfgs, monkeypatch):
     # a stored three-way session, resumed: a fresh pairing's first turn
     # would seed opencode's shadow through its binary, which CI lacks
@@ -1319,3 +1339,41 @@ def test_no_review_flag_leaves_the_delivery_mode_alone(homes, ok_versions, chat_
     result = click.testing.CliRunner().invoke(cli.main, ["--no-review"])
     assert result.exit_code == 0, result.output
     assert [(c.navigator, c.navigator_deliver) for c in chat_cfgs] == [("", "prompt")]
+
+
+@pytest.mark.parametrize("position,line_index", [({"time": 2, "id": "msg_old"}, 5), (None, 5), ({"seq": "2"}, 0)])
+def test_opencode2_resume_rejects_unsafe_cursors_without_pair_changes(homes, monkeypatch, position, line_index):
+    from tandem.harness import opencode2
+
+    monkeypatch.setattr(cli, "_resolve_participants", lambda warn_only=False: (["codex", "opencode"], {"codex": "0.145.0", "opencode": "2.0.21"}))
+    adapter = opencode2.Opencode2Adapter()
+    monkeypatch.setattr(adapter, "transcript_path", lambda cwd, sid: homes / "existing.db")
+    monkeypatch.setattr(cli, "get_adapter", lambda harness: adapter)
+    with StateStore() as store:
+        pair = store.create_session(str(homes), "opencode", ["codex", "opencode"], {"codex": "x", "opencode": "ses_test"})
+        cursor = store.get_cursor(pair.tandem_id, "opencode", "codex")
+        cursor.line_index = line_index
+        cursor.pending = {"source_pos": position}
+        store.save_cursor(cursor)
+        before = store.get_cursor(pair.tandem_id, "opencode", "codex")
+        with pytest.raises(click.ClickException, match="cursor"):
+            cli._narrow_participants(store, pair)
+        assert store.get_cursor(pair.tandem_id, "opencode", "codex") == before
+        assert store.get_session(pair.tandem_id).participants == pair.participants
+
+
+def test_opencode2_resume_reports_retained_history_without_conversion_advice(homes, monkeypatch):
+    from tandem.harness import opencode2
+
+    db = homes / "legacy.db"
+    with opencode2.database(db) as conn:
+        conn.executescript("CREATE TABLE session(id TEXT PRIMARY KEY); INSERT INTO session VALUES ('ses_legacy');")
+    monkeypatch.setattr(opencode2, "db_path", lambda: db)
+    monkeypatch.setattr(cli, "_resolve_participants", lambda warn_only=False: (["codex", "opencode"], {"codex": "0.145.0", "opencode": "2.0.21"}))
+    monkeypatch.setattr(cli, "get_adapter", lambda harness: opencode2.Opencode2Adapter())
+    with StateStore() as store:
+        pair = store.create_session(str(homes), "opencode", ["codex", "opencode"], {"codex": "x", "opencode": "ses_legacy"})
+        with pytest.raises(click.ClickException, match="unsupported") as exc:
+            cli._narrow_participants(store, pair)
+        assert "migrate-opencode" not in str(exc.value)
+        assert store.get_session(pair.tandem_id).participants == pair.participants

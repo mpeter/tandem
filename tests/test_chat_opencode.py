@@ -228,6 +228,21 @@ def test_server_is_told_which_session_it_belongs_to(tmp_path, monkeypatch):
     assert seen[0]["TANDEM_SESSION_ID"] == "tdm-opencode"
 
 
+def test_v1_runtime_cannot_spawn_opencode_two(tmp_path, monkeypatch):
+    from tandem.chat.runtime import opencode as mod
+
+    monkeypatch.setattr(mod.compat, "detect_cli_version",
+                        lambda binary: "opencode v2.0.21")
+    monkeypatch.setattr(
+        mod.subprocess, "Popen",
+        lambda *a, **kw: pytest.fail("unsupported OpenCode must not be spawned"),
+    )
+    rt = OpencodeRuntime(ChatConfig())
+
+    with pytest.raises(RuntimeError, match="OpenCode 2 requires the v2 chat runtime"):
+        rt.ensure_server(str(tmp_path))
+
+
 # -- @path mentions become file parts, as opencode's own TUI sends them ---------
 
 @pytest.fixture

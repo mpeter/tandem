@@ -572,7 +572,7 @@ class CodexRuntime:
             parts = []
             window = getattr(n.tokenUsage, "modelContextWindow", None)
             if window:
-                parts.append(f"{round(total.totalTokens * 100 / window)}% ctx")
+                parts.append(f"{round(n.tokenUsage.last.totalTokens * 100 / window)}% ctx")
             parts.append(f"{total.inputTokens}↑ {total.outputTokens}↓")
             self._usage = " · ".join(parts)
         elif method == "account/rateLimits/updated":

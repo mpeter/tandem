@@ -100,7 +100,7 @@ def test_bridge_agent_definition():
     front = text.split("---")[1]
     assert re.search(r"^name:\s*codex-worker\s*$", front, re.M)
     assert re.search(r"^model:\s*haiku\s*$", front, re.M)
-    assert re.search(r"^tools:\s*Bash\(tandem sub:\*\)\s*$", front, re.M)
+    assert re.search(r"^tools:\s*Bash, SubagentHandback\s*$", front, re.M)
     body = text.split("---", 2)[2]
     assert "tandem sub" in body
     assert "verbatim" in body
@@ -133,7 +133,7 @@ def test_gpt_alias_agent_definition():
     front = text.split("---")[1]
     assert re.search(r"^name:\s*gpt\s*$", front, re.M)
     assert re.search(r"^model:\s*haiku\s*$", front, re.M)
-    assert re.search(r"^tools:\s*Bash\(tandem sub:\*\)\s*$", front, re.M)
+    assert re.search(r"^tools:\s*Bash, SubagentHandback\s*$", front, re.M)
     # user-facing: the description must invite selection (unlike
     # codex-worker's "not meant for manual selection")
     desc = re.search(r"^description:\s*(.+)$", front, re.M).group(1)
@@ -166,3 +166,18 @@ def test_loop_guard_covers_both_relay_agents():
         front = f.read_text().split("---")[1]
         names.add(re.search(r"^name:\s*(\S+)\s*$", front, re.M).group(1))
     assert names == set(RELAY_NAMES)
+
+
+def test_plugin_hooks_enforce_relay_tool_and_handback_contract():
+    from tandem.relayguard import PRE_HOOK_COMMAND
+
+    hooks = json.loads((PLUGIN / "hooks" / "hooks.json").read_text())["hooks"]
+    assert hooks["PreToolUse"][1]["matcher"] == "*"
+    assert hooks["PreToolUse"][1]["hooks"][0]["command"] == PRE_HOOK_COMMAND
+    assert hooks["SubagentStop"][0]["matcher"] == "^tandem:(gpt|codex-worker)$"
+    assert hooks["SubagentStop"][0]["hooks"][0]["command"] == PRE_HOOK_COMMAND.replace(" pre ", " stop ")
+    assert hooks["PostToolUse"][0]["hooks"][0]["command"] == PRE_HOOK_COMMAND.replace(" pre ", " post ")
+    for name in ("gpt", "codex-worker"):
+        front = (PLUGIN / "agents" / f"{name}.md").read_text().split("---")[1]
+        assert re.search(r"^maxTurns:\s*6\s*$", front, re.M)
+        assert "hooks:" not in front  # Claude ignores plugin agent frontmatter hooks

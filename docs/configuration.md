@@ -209,6 +209,9 @@ closes. Every other leading `/word` goes to the current harness as its own
 slash command; for opencode a listed command runs through its command
 endpoint, as its TUI would.
 
+Codex context percentages use the latest model call, while token totals remain
+cumulative.
+
 Codex chat selects named permission profiles (`:read-only`, `:workspace`, or
 `:danger-full-access`) and verifies the effective profile, sandbox, and approval
 policy before starting a turn. A server that cannot supply or apply the requested

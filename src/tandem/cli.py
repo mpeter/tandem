@@ -6,6 +6,7 @@ import json
 import os
 import re
 import shutil
+import sqlite3
 import sys
 import time
 from datetime import datetime, timezone
@@ -51,10 +52,10 @@ def _resolve_participants(warn_only: bool = False) -> tuple[list[str], dict[str,
 
     Not-installed is a normal state: silent skip, zero further probes.
     Installed but unusable (version below the compat floor, runtime not
-    ready) warns and skips — fail closed. Above-ceiling versions warn but
-    stay usable (drift, not proven breakage). Fewer than two usable is an
-    error naming what's missing (warn-only mode reports instead, for
-    status/resume)."""
+    ready, or a known-incompatible major) warns and skips — fail closed.
+    Above-ceiling versions without a known break warn but stay usable. Fewer
+    than two usable is an error naming what's missing (warn-only mode reports
+    instead, for status/resume)."""
     from .config import load_harnesses
     from .harness import ADAPTERS
 
@@ -73,6 +74,14 @@ def _resolve_participants(warn_only: bool = False) -> tuple[list[str], dict[str,
             continue                      # silent: the invariant
         if not adapter.version_supported(v):
             tested = compat.COMPAT[hid].tested
+            reason = compat.hard_rejection_reason(hid, v)
+            if reason is not None:
+                click.secho(
+                    f"warning: {adapter.display_name} version {v!r} is "
+                    f"unsupported ({reason}) — excluded from this session.",
+                    fg="yellow", err=True,
+                )
+                continue
             parsed = compat.parse_version(v)
             if parsed is not None and parsed < compat.COMPAT[hid].min_version:
                 # Below the floor the session format predates what tandem was
@@ -125,9 +134,45 @@ def _resolve_participants(warn_only: bool = False) -> tuple[list[str], dict[str,
 def _narrow_participants(store: StateStore, session: PairedSession) -> PairedSession:
     """Resume rule (spec: Participants/Resume): members gone missing are
     dropped from the session for good; narrowed list persisted; active moves
-    to the first survivor if it was dropped; <2 survivors is fatal. No
-    dynamic rejoin."""
-    usable, _ = _resolve_participants(warn_only=True)
+    to the first survivor if it was dropped; <2 survivors is fatal. Known
+    incompatible versions are fatal without changing stored membership."""
+    usable, versions = _resolve_participants(warn_only=True)
+    incompatible = []
+    for h in session.participants:
+        version = versions.get(h)
+        if version is None:
+            continue
+        reason = compat.hard_rejection_reason(h, version)
+        if reason is not None:
+            incompatible.append((h, version, reason))
+    if incompatible:
+        harness, version, reason = incompatible[0]
+        click.secho(
+            f"error: cannot resume session {session.tandem_id}: "
+            f"{get_adapter(harness).display_name} version {version!r} is "
+            f"unsupported ({reason}). Session membership was left unchanged; "
+            "use a supported version to resume it or start a new pair.",
+            fg="red", err=True,
+        )
+        sys.exit(1)
+    oc_version = compat.parse_version(versions.get("opencode") or "")
+    if "opencode" in session.participants and oc_version and oc_version[0] == 2:
+        adapter = get_adapter("opencode")
+        native_id = session.native_id("opencode")
+        try:
+            transcript = adapter.transcript_path(session.cwd, native_id) if native_id else None
+            if transcript is None:
+                raise ValueError(
+                    "OpenCode 2 transcript is missing. Retained OpenCode 1 resume "
+                    "is unsupported in this build; start a fresh pair. Session "
+                    "membership was left unchanged."
+                )
+            from .harness.opencode2 import cursor_sequence
+
+            for target in session.targets_for("opencode"):
+                cursor_sequence(store.get_cursor(session.tandem_id, "opencode", target))
+        except (ValueError, OSError, sqlite3.Error) as exc:
+            raise click.ClickException(str(exc)) from exc
     survivors = [h for h in session.participants if h in usable]
     if survivors == session.participants:
         return session
@@ -801,7 +846,7 @@ def _chat(harness: str | None, fresh: bool, resume_id: str | None = None,
               help="Worker context: cold task-only, or a full fork of the "
                    "paired session (config policy decides by default).")
 @click.option("-q", "--quiet", is_flag=True,
-              help="Print only the worker's final message (raw codex output "
+              help="Print the worker's final message and dispatch receipt (raw codex output "
                    "goes to a log under ~/.tandem/subagents/<id>/logs). Used "
                    "by the bridge agent, which relays stdout verbatim.")
 @click.option("--sandbox", "sandbox",
@@ -963,7 +1008,25 @@ def _read_sandbox_stamp(tandem_id: str) -> str:
     # read failure would crash the dispatch instead of dropping the flag.
     except (OSError, ValueError):
         return ""
-    return text if text == "workspace-write" else ""
+    return text if text in {"read-only", "workspace-write"} else ""
+
+
+@main.command(name="hook-relay")
+@click.argument("phase", type=click.Choice(["pre", "stop", "post"]))
+def hook_relay_cmd(phase: str) -> None:
+    """Enforce the plugin relay's tool and completion contracts."""
+    from .relayguard import decision
+
+    try:
+        payload = json.loads(sys.stdin.read())
+        if not isinstance(payload, dict):
+            raise ValueError("Hook payload must be an object")
+        result = decision(payload, phase)
+    except (ValueError, OSError, TypeError):
+        click.echo("Cannot validate relay hook input.", err=True)
+        sys.exit(2)
+    if result is not None:
+        click.echo(json.dumps(result))
 
 
 @main.command(name="hook-route")

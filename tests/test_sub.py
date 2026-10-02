@@ -327,7 +327,10 @@ class TestQuietRelay:
         # -o is an exec-level flag: it must precede the `resume` subcommand
         assert calls["o_before_resume"]
         # stdout carries the worker's answer and nothing else
-        assert capsys.readouterr().out == "FINAL ANSWER\n"
+        out = capsys.readouterr().out
+        assert out.startswith("FINAL ANSWER\n")
+        from tandem.relayguard import _receipt_code
+        assert _receipt_code(out, "t") == 0
         # the raw transcript is redirected to a retained log for debugging
         logs = (paths.tandem_home() / "subagents" / env.session.tandem_id
                 / "logs")
@@ -1002,18 +1005,24 @@ class TestDoctorAndStatus:
 
 
 class TestSandboxPlumbing:
+    @pytest.mark.parametrize("sandbox,permission", [
+        ("read-only", ":read-only"), ("workspace-write", ":workspace"),
+    ])
     def test_run_sub_passes_sandbox_before_resume(self, env_factory,
-                                                  monkeypatch):
+                                                  monkeypatch, sandbox, permission):
         env = env_factory(active="claude")
         calls = {}
         monkeypatch.setattr(
             ops, "_run",
             lambda argv, cwd=None, **kw: calls.update(argv=argv) or _R(0),
         )
-        ops.run_sub(env.store, env.session, "t", sandbox="workspace-write")
+        ops.run_sub(env.store, env.session, "t", sandbox=sandbox)
         argv = calls["argv"]
         i = argv.index("--sandbox")
-        assert argv[i + 1] == "workspace-write"
+        assert argv[i + 1] == sandbox
+        config = argv.index("-c")
+        assert argv[config + 1] == f'default_permissions="{permission}"'
+        assert config < argv.index("resume")
         assert i < argv.index("resume")   # exec-level flag, like -m and -o
 
     def test_run_sub_default_omits_sandbox(self, env_factory, monkeypatch):

@@ -38,6 +38,7 @@ from pathlib import Path
 from typing import Callable
 from urllib.parse import urlparse
 
+from ... import compat
 from ..commands import Command
 from ..events import (Answers, ApprovalRequest, Failure, FileDiff, LiveEvent, QuestionRequest,
                       TextDelta, ThinkingDelta, ToolFinished, ToolOutput, ToolStarted,
@@ -156,6 +157,15 @@ class OpencodeRuntime:
                       tandem_id: str | None = None) -> str:
         if self._injected:
             return self.base_url
+        if self.binary == ["opencode"]:
+            version = compat.detect_cli_version("opencode")
+            parsed = compat.parse_version(version or "")
+            if parsed and parsed[0] == 2:
+                raise RuntimeError("OpenCode 2 requires the v2 chat runtime")
+            reason = (compat.hard_rejection_reason("opencode", version)
+                      if version else None)
+            if reason is not None:
+                raise RuntimeError(reason)
         with self._lock:
             if self._proc is not None and self._proc.poll() is None and self.base_url:
                 return self.base_url

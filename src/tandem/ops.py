@@ -20,6 +20,7 @@ import subprocess
 import sys
 import time
 from contextlib import contextmanager
+from dataclasses import replace
 from pathlib import Path
 
 from . import paths
@@ -33,6 +34,17 @@ from .util import append_jsonl_fsync, read_jsonl, uuid7
 # seam for tests (patching subprocess.run itself would also intercept the
 # CLI version probes)
 _run = subprocess.run
+
+
+def _preflight_storage(store: StateStore, session: PairedSession) -> None:
+    if "opencode" not in session.participants:
+        return
+    check = getattr(get_adapter("opencode"), "preflight_session", None)
+    if check is not None:
+        check(session, [
+            store.get_cursor(session.tandem_id, "opencode", target)
+            for target in session.targets_for("opencode")
+        ])
 
 
 def source_transcript(session: PairedSession, source: str) -> Path | None:
@@ -56,6 +68,7 @@ def drain_source(
     direction whose last synced event is still the user's prompt gets that
     note appended too — a turn that ended in failure recorded the prompt and
     no reply, and a shadow left on a user message is not resumable."""
+    _preflight_storage(store, session)
     transcript = source_transcript(session, source)
     if transcript is None:
         # not written yet is fine; read once and gone now is lost turns
@@ -87,6 +100,7 @@ def fast_forward(store: StateStore, session: PairedSession, source: str,
                  target: str) -> None:
     """Mark everything currently in `source`'s store as already-synced for
     the (source -> target) direction."""
+    _preflight_storage(store, session)
     cursor = store.get_cursor(session.tandem_id, source, target)
     get_adapter(source).fast_forward_cursor(session, cursor)
     cursor.pending.pop("intent", None)
@@ -120,6 +134,8 @@ def switch_session(store: StateStore, session: PairedSession,
     new_active = to or session.next_active(old_active)
     if new_active not in session.participants:
         raise SyncSetupError(f"{new_active} is not a participant")
+
+    _preflight_storage(store, session)
 
     # If codex never ran (id pending), its shadow file does not exist yet;
     # create it now so the flip has something to resume.
@@ -268,6 +284,7 @@ def prepare_turn(store: StateStore, session: PairedSession,
     so only the new turn flows back afterwards. (When target IS the active
     side there is nothing to fast-forward — its cursor is live.) Returns the
     session, refreshed when a seed minted an id."""
+    _preflight_storage(store, session)
     session = _seed_late_shadows(store, session, target)
     drain_source(store, session, session.active, flush_dangling=True)
     if (target != session.active and session.native_id(target)
@@ -281,6 +298,11 @@ def adopt_native_id(store: StateStore, session: PairedSession, harness: str,
     """A harness minted its own session id during a turn (codex on its first
     run). Record it and start every outgoing cursor of that harness at zero
     so the whole new file is translated on the next drain."""
+    _preflight_storage(store, session)
+    if harness == "opencode":
+        _preflight_storage(store, replace(
+            session, native_session_ids={**session.native_session_ids, harness: native_id},
+        ))
     store.set_native_session_id(session.tandem_id, harness, native_id)
     session = store.get_session(session.tandem_id) or session
     for other in session.targets_for(harness):
@@ -305,6 +327,7 @@ def sync_after_turn(store: StateStore, session: PairedSession, target: str,
     ends there gets the note appended as its own placeholder. It rides inside
     the drain, before the fast-forward above, so the recipients that echo-
     suppress cover the note too."""
+    _preflight_storage(store, session)
     echo_pre: dict[str, tuple[int | None, dict[str, int]]] = {}
     for side in session.targets_for(target):
         size = _file_size(source_transcript(session, side))

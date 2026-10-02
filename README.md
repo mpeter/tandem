@@ -80,6 +80,16 @@ their completion marker. Transcript
 silence never ends a running tool call or approval wait. If completion cannot be
 confirmed, cancel the switch or exit the native harness manually.
 
+OpenCode has separate adapters for **1.18+** and **2.0.21+**. OpenCode 2 uses
+its native session import and settled transcript format. Newer major versions
+remain excluded until verified. Its native interface supports fresh pairs;
+chat requires the OpenCode 2 chat runtime, which is not yet enabled.
+
+Retained OpenCode 1 sessions remain unsupported even after native migration
+completes: their converted history and sync cursors need verified reconciliation.
+Start a fresh pair to use OpenCode 2. Retained rows and existing pair membership
+stay intact.
+
 ## What's new in 0.5
 
 **Rate-limit windows on the tab bar.** Every slot now shows its account's

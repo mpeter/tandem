@@ -165,7 +165,8 @@ def test_opencode_meter_splits_turns_and_tracks_last_context():
     # reasoning tokens are separate in opencode's block but a subset of
     # output in codex's — folding them into output makes ↓ mean the same
     # thing on both slots
-    m = get_adapter("opencode").make_usage_meter()
+    from tandem.harness.opencode import OpencodeAdapter
+    m = OpencodeAdapter().make_usage_meter()
     a1 = {"id": "a1", "tokens": {"input": 100, "output": 50, "reasoning": 10,
                                  "cache": {"read": 400, "write": 20}}}
     a2 = {"id": "a2", "tokens": {"input": 200, "output": 80, "reasoning": 0,
@@ -179,7 +180,8 @@ def test_opencode_meter_splits_turns_and_tracks_last_context():
 
 
 def test_opencode_meter_skips_assistants_without_tokens():
-    m = get_adapter("opencode").make_usage_meter()
+    from tandem.harness.opencode import OpencodeAdapter
+    m = OpencodeAdapter().make_usage_meter()
     m.feed(_oc_turn([{"id": "a1"}]))
     assert m.snapshot().bar_text() == ""
 
@@ -187,7 +189,8 @@ def test_opencode_meter_skips_assistants_without_tokens():
 def test_opencode_meter_ignores_all_zero_sentinel_rows():
     # tandem-seeded shadow rows carry a tokens block of all zeros; they must
     # not blank a real context reading
-    m = get_adapter("opencode").make_usage_meter()
+    from tandem.harness.opencode import OpencodeAdapter
+    m = OpencodeAdapter().make_usage_meter()
     real = {"id": "a1", "tokens": {"input": 100, "output": 50, "reasoning": 0,
                                    "cache": {"read": 400, "write": 0}}}
     sentinel = {"id": "a2", "tokens": {"input": 0, "output": 0, "reasoning": 0,

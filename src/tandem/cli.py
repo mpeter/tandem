@@ -846,7 +846,7 @@ def _chat(harness: str | None, fresh: bool, resume_id: str | None = None,
               help="Worker context: cold task-only, or a full fork of the "
                    "paired session (config policy decides by default).")
 @click.option("-q", "--quiet", is_flag=True,
-              help="Print only the worker's final message (raw codex output "
+              help="Print the worker's final message and dispatch receipt (raw codex output "
                    "goes to a log under ~/.tandem/subagents/<id>/logs). Used "
                    "by the bridge agent, which relays stdout verbatim.")
 @click.option("--sandbox", "sandbox",
@@ -1008,7 +1008,25 @@ def _read_sandbox_stamp(tandem_id: str) -> str:
     # read failure would crash the dispatch instead of dropping the flag.
     except (OSError, ValueError):
         return ""
-    return text if text == "workspace-write" else ""
+    return text if text in {"read-only", "workspace-write"} else ""
+
+
+@main.command(name="hook-relay")
+@click.argument("phase", type=click.Choice(["pre", "stop", "post"]))
+def hook_relay_cmd(phase: str) -> None:
+    """Enforce the plugin relay's tool and completion contracts."""
+    from .relayguard import decision
+
+    try:
+        payload = json.loads(sys.stdin.read())
+        if not isinstance(payload, dict):
+            raise ValueError("Hook payload must be an object")
+        result = decision(payload, phase)
+    except (ValueError, OSError, TypeError):
+        click.echo("Cannot validate relay hook input.", err=True)
+        sys.exit(2)
+    if result is not None:
+        click.echo(json.dumps(result))
 
 
 @main.command(name="hook-route")

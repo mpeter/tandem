@@ -124,12 +124,14 @@ def _touch(path, mtime):
     os.utime(path, (mtime, mtime))
 
 
-def test_wait_idle_when_sentinel_newer_than_transcript(tmp_path):
+@pytest.mark.parametrize("marker_wired", [False, True])
+def test_wait_idle_when_sentinel_newer_than_transcript(tmp_path, marker_wired):
     t, s = tmp_path / "t.jsonl", tmp_path / "s.turn"
     now = time.time()
     _touch(t, now - 10)
     _touch(s, now - 5)   # marker closed the last turn
-    assert wait_until_safe(t, s, cancelled=lambda: False) is True
+    assert wait_until_safe(t, s, cancelled=lambda: False,
+                           marker_wired=marker_wired) is True
 
 
 def test_wait_idle_when_no_files(tmp_path):
@@ -154,42 +156,47 @@ def test_wait_quiescence_fallback(tmp_path):
     )
 
 
-def test_wait_idle_when_no_files_wired(tmp_path):
-    # Fresh session: the harness has written nothing and the hook has not run
-    # yet, so 0 >= 0 reads idle in *both* modes. The flip must fire at once,
-    # not sit behind the wired mode's missed-marker valve.
-    assert (
-        wait_until_safe(tmp_path / "none", tmp_path / "none2",
-                        cancelled=lambda: False, marker_wired=True)
-        is True
-    )
+def test_wait_missing_marker_wired_does_not_infer_idle(tmp_path):
+    # No transcript or marker yet can also mean startup or pending approval.
+    polls = 0
+
+    def cancel():
+        nonlocal polls
+        polls += 1
+        return polls > 2
+
+    assert wait_until_safe(tmp_path / "none", tmp_path / "none2",
+                           cancelled=cancel, marker_wired=True, poll=0) is False
+    assert polls == 3
 
 
-def test_wait_wired_ignores_turn_pacing_quiet(tmp_path):
-    # With the marker wired, transcript quiet is NOT a turn boundary: a long
-    # tool call writes nothing between the tool_use append and the tool_result
-    # append, and firing there kills the harness mid-turn. quiesce is scaled
-    # down (1.0 stands in for the real 120s valve) to keep the test fast — the
-    # valve does eventually trip, it is just never the normal trigger.
+def test_wait_wired_long_tool_or_approval_wait_requires_marker(tmp_path):
     t, s = tmp_path / "t.jsonl", tmp_path / "s.turn"
-    _touch(t, time.time())         # turn in flight
-    _touch(s, time.time() - 30)    # marker live, but this turn is still open
+    _touch(t, time.time() - 3600)   # unfinished turn silent beyond the old valve
+    _touch(s, time.time() - 7200)   # only the previous turn completed
     done = threading.Event()
+    cancel = threading.Event()
     result = {}
 
     def waiter():
-        result["ok"] = wait_until_safe(t, s, cancelled=lambda: False,
-                                       quiesce=1.0, poll=0.05,
+        result["ok"] = wait_until_safe(t, s, cancelled=cancel.is_set,
+                                       quiesce=0.1, poll=0.05,
                                        marker_wired=True)
         done.set()
 
-    threading.Thread(target=waiter, daemon=True).start()
-    assert not done.wait(timeout=0.5)   # 0.5s of quiet: still waiting
-    assert done.wait(timeout=3)         # valve trips once quiesce elapses
-    assert result["ok"] is True
+    thread = threading.Thread(target=waiter, daemon=True)
+    thread.start()
+    try:
+        assert not done.wait(timeout=0.3)  # even an explicit timeout is ignored
+        _touch(s, time.time())            # completion, not silence, releases
+        assert done.wait(timeout=2)
+        assert result["ok"] is True
+    finally:
+        cancel.set()
+        thread.join(timeout=2)
 
 
-def test_wait_wired_default_quiesce_is_the_valve_not_2s(tmp_path):
+def test_wait_wired_default_ignores_quiescence(tmp_path):
     # The mode's whole point: the same 3s-quiet mid-turn transcript that the
     # marker-less mode calls idle must still be mid-turn when the marker is
     # wired, on default settings.
@@ -207,8 +214,8 @@ def test_wait_wired_default_quiesce_is_the_valve_not_2s(tmp_path):
         done.set()
 
     threading.Thread(target=waiter, daemon=True).start()
-    assert not done.wait(timeout=0.4)   # parked behind the 120s valve
-    cancel.set()                        # don't leave it parked for 120s
+    assert not done.wait(timeout=0.4)   # still waiting for completion
+    cancel.set()                        # cancellation remains available
     assert done.wait(timeout=2)
     assert result["ok"] is False
 
@@ -255,30 +262,32 @@ def test_wait_blocks_midturn_then_marker_releases(tmp_path):
 
 
 def test_wait_unknown_transcript_wired_is_not_read_as_idle(tmp_path):
-    # codex mints its own session id, so the flip monitor starts with no
-    # transcript at all. _mtime(None) is 0.0, which would make `s >= t` true
-    # against any sentinel and fire the flip instantly — mid-turn. No
-    # evidence is not idleness: hold, and let the valve decide.
+    # A previous marker cannot prove completion before rollout discovery.
     s = tmp_path / "s.turn"
-    _touch(s, time.time() - 30)      # a previous turn's marker exists
-    done = threading.Event()
+    _touch(s, time.time() - 30)
+    cancel, done = threading.Event(), threading.Event()
     result = {}
 
     def waiter():
-        result["ok"] = wait_until_safe(None, s, cancelled=lambda: False,
-                                       quiesce=1.0, poll=0.05,
+        result["ok"] = wait_until_safe(None, s, cancelled=cancel.is_set,
+                                       quiesce=0.1, poll=0.05,
                                        marker_wired=True)
         done.set()
 
-    threading.Thread(target=waiter, daemon=True).start()
-    assert not done.wait(timeout=0.5)   # did NOT fire instantly
-    assert done.wait(timeout=3)         # valve, anchored to arm time
-    assert result["ok"] is True
+    thread = threading.Thread(target=waiter, daemon=True)
+    thread.start()
+    try:
+        assert not done.wait(timeout=0.3)
+    finally:
+        cancel.set()
+        thread.join(timeout=2)
+    assert done.is_set()
+    assert result["ok"] is False
 
 
 def test_wait_provider_publishing_a_path_restores_normal_rules(tmp_path):
     # The tail thread discovers the rollout mid-wait and publishes it; from
-    # that poll on the ordinary marker/quiescence rules apply.
+    # that poll on the ordinary completion-marker rule applies.
     t, s = tmp_path / "t.jsonl", tmp_path / "s.turn"
     _touch(s, time.time() - 30)
     published: list = [None]
@@ -487,7 +496,8 @@ def test_monitor_toggle_cancels(tmp_path):
     _touch(t, time.time())           # mid-turn: monitor will block
     _touch(s, time.time() - 30)
     control = _StubControl()
-    m = FlipMonitor(control, [b"\x04"], transcript=t, sentinel=s)
+    m = FlipMonitor(control, [b"\x04"], transcript=t, sentinel=s,
+                    marker_wired=True, poll=0.05)
     m.start()
     m.flip_pressed()
     time.sleep(0.1)
@@ -508,28 +518,44 @@ def test_monitor_stop_unblocks_cleanly(tmp_path):
     assert m.flip_requested is False
 
 
-def test_monitor_quiesce_defaults_by_mode(tmp_path):
+def test_monitor_stop_cancels_armed_marker_wait(tmp_path):
+    # Manual harness exit stops the monitor without terminating it again.
+    t, s = tmp_path / "t.jsonl", tmp_path / "s.turn"
+    _touch(t, time.time() - 3600)
+    control = _StubControl()
+    m = FlipMonitor(control, [b"\x04"], transcript=t, sentinel=s,
+                    marker_wired=True, poll=0.05)
+    m.start()
+    m.flip_pressed()
+    try:
+        time.sleep(0.1)
+        assert m.armed() is True
+        assert m.flip_requested is False
+    finally:
+        m.stop()
+    assert not m._thread.is_alive()
+    assert m.flip_requested is False
+    assert control.calls == []
+
+
+def test_monitor_quiesce_default_and_override(tmp_path):
     s = tmp_path / "s.turn"
     unwired = FlipMonitor(_StubControl(), [], None, s)
     wired = FlipMonitor(_StubControl(), [], None, s, marker_wired=True)
     override = FlipMonitor(_StubControl(), [], None, s, marker_wired=True,
                            quiesce=1.5)
     assert unwired.quiesce == 2.0        # marker-less fallback
-    assert wired.quiesce == 120.0        # missed-marker valve, not turn pacing
+    assert wired.quiesce == 2.0          # ignored when marker is wired
     assert override.quiesce == 1.5       # explicit injection wins
-    # The valve has to outlast the longest silence a real turn can produce (a
-    # full test suite between the tool_use and tool_result appends), because
-    # firing early kills that turn while firing late only costs a wait.
-    assert wired.quiesce > 60.0
 
 
 def test_monitor_passes_mode_through_to_wait(tmp_path, monkeypatch):
     seen = {}
 
     def fake_wait(transcript, sentinel, cancelled, quiesce=None, poll=0.2,
-                  marker_wired=False, provider=None, status_probe=None):
+                  marker_wired=False, provider=None, status_probe=None, turn_boundary=None):
         seen.update(quiesce=quiesce, poll=poll, marker_wired=marker_wired,
-                    provider_reads=provider())
+                    provider_reads=provider(), turn_boundary=turn_boundary)
         return True
 
     monkeypatch.setattr(runner, "wait_until_safe", fake_wait)
@@ -544,8 +570,8 @@ def test_monitor_passes_mode_through_to_wait(tmp_path, monkeypatch):
         time.sleep(0.05)
     m.stop()
     assert m.flip_requested is True
-    assert seen == {"quiesce": 120.0, "poll": 0.05, "marker_wired": True,
-                    "provider_reads": None}
+    assert seen == {"quiesce": 2.0, "poll": 0.05, "marker_wired": True,
+                    "provider_reads": None, "turn_boundary": None}
 
 
 # -- the runner wiring the frame ------------------------------------------
@@ -826,7 +852,7 @@ def test_session_status_tolerates_garbage_files(tmp_path, monkeypatch):
 
 def test_wait_probe_waiting_overrides_busy_mtimes(tmp_path):
     # transcript newer than sentinel: the mtime rules read mid-turn and
-    # would hold for the 120s valve. The probe says the session is at its
+    # would hold for completion. The probe says the session is at its
     # prompt, and the probe is the whole test now.
     t, s = tmp_path / "t.jsonl", tmp_path / "s.turn"
     _touch(t, time.time())
@@ -1697,3 +1723,182 @@ def test_runner_pokes_the_poller_when_a_response_lands(env_factory, monkeypatch)
 
     monkeypatch.setattr(runner, "run_in_pty", fake_run_in_pty)
     runner.InteractiveRunner(env.session, lambda st, se, so, tg: _Sink()).run()
+
+
+def test_codex_auxiliary_notify_does_not_flip_running_primary_turn(env_factory, monkeypatch):
+    env = env_factory(active="codex")
+    env.codex_shadow.write_text(json.dumps({
+        "type": "event_msg", "payload": {"type": "task_started", "turn_id": "primary"},
+    }) + "\n")
+    made = {}
+    real_monitor = runner.FlipMonitor
+
+    def capture(*args, **kwargs):
+        made["monitor"] = real_monitor(*args, **kwargs)
+        return made["monitor"]
+
+    monkeypatch.setattr(runner, "FlipMonitor", capture)
+    monkeypatch.setattr(runner.PtyControl, "terminate", lambda *a, **kw: "test")
+
+    def native_turn(argv, **kwargs):
+        monitor = made["monitor"]
+        monitor.sentinel.touch()  # native title thread's notify, not primary completion
+        monitor.flip_pressed()
+        time.sleep(0.3)
+        assert not monitor.flip_requested
+        with env.codex_shadow.open("a") as stream:
+            stream.write(json.dumps({"type": "event_msg", "payload": {
+                "type": "task_complete", "turn_id": "primary",
+            }}) + "\n")
+        deadline = time.monotonic() + 2
+        while not monitor.flip_requested and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert monitor.flip_requested
+        return 0
+
+    monkeypatch.setattr(runner, "run_in_pty", native_turn)
+    result = runner.InteractiveRunner(env.session, _null_sink)
+    assert result.run() == 0
+    assert result.flip_requested
+
+
+def _codex_lifecycle(path, kind, turn_id="primary", mode="a"):
+    with path.open(mode) as stream:
+        stream.write(json.dumps({"type": "event_msg", "payload": {
+            "type": kind, "turn_id": turn_id,
+        }}) + "\n")
+
+
+@pytest.mark.parametrize("terminal", ["task_complete", "turn_aborted"])
+def test_codex_primary_boundary_terminal_and_late_writes(tmp_path, terminal):
+    path = tmp_path / "rollout.jsonl"
+    probe = runner.CodexTurnBoundary()
+    assert not probe(None)
+    assert not probe(path)
+    _codex_lifecycle(path, "task_started", mode="w")
+    assert not probe(path)
+    _codex_lifecycle(path, terminal, turn_id="auxiliary")
+    assert not probe(path)
+    _codex_lifecycle(path, terminal)
+    assert probe(path)
+    _codex_lifecycle(path, "token_count")
+    assert probe(path)  # housekeeping after the terminal event is not a new turn
+    _codex_lifecycle(path, "task_started", turn_id="next")
+    assert not probe(path)
+
+
+def test_codex_primary_boundary_partial_corrupt_replaced_and_truncated(tmp_path):
+    path = tmp_path / "rollout.jsonl"
+    probe = runner.CodexTurnBoundary()
+    _codex_lifecycle(path, "task_started", mode="w")
+    partial = json.dumps({"type": "event_msg", "payload": {
+        "type": "task_complete", "turn_id": "primary",
+    }})
+    with path.open("a") as stream:
+        stream.write(partial)
+    assert not probe(path)
+    with path.open("a") as stream:
+        stream.write("\n")
+    assert probe(path)
+    with path.open("a") as stream:
+        stream.write("invalid\n")
+    assert not probe(path)
+    _codex_lifecycle(path, "task_complete")
+    assert not probe(path)
+    _codex_lifecycle(path, "task_started", mode="w")
+    assert not probe(path)
+    _codex_lifecycle(path, "task_complete")
+    assert probe(path)
+    replacement = tmp_path / "replacement"
+    _codex_lifecycle(replacement, "task_started", mode="w")
+    replacement.replace(path)
+    assert not probe(path)
+    path.unlink()
+    assert not probe(path)
+
+
+def test_codex_primary_boundary_requires_tool_result_and_terminal(tmp_path):
+    path = tmp_path / "rollout.jsonl"
+    probe = runner.CodexTurnBoundary()
+    _codex_lifecycle(path, "task_started", mode="w")
+    with path.open("a") as stream:
+        stream.write(json.dumps({"type": "response_item", "payload": {
+            "type": "custom_tool_call", "call_id": "sleep",
+        }}) + "\n")
+    _codex_lifecycle(path, "task_complete")
+    assert not probe(path)
+    with path.open("a") as stream:
+        stream.write(json.dumps({"type": "response_item", "payload": {
+            "type": "custom_tool_call_output", "call_id": "sleep", "output": "done",
+        }}) + "\n")
+    assert probe(path)
+
+
+def test_codex_primary_boundary_no_lifecycle_and_error_without_terminal_hold(tmp_path):
+    path = tmp_path / "rollout.jsonl"
+    probe = runner.CodexTurnBoundary()
+    path.write_text(json.dumps({"type": "session_meta", "payload": {"id": "primary"}}) + "\n")
+    assert not probe(path)
+    _codex_lifecycle(path, "task_started")
+    _codex_lifecycle(path, "error")
+    assert not probe(path)
+
+
+def test_codex_custom_notify_retains_markerless_fallback(env_factory, monkeypatch):
+    from tandem.harness.codex import CodexAdapter
+    env = env_factory(active="codex")
+    monkeypatch.setattr(CodexAdapter, "hook_argv_extra", lambda self, sentinel: [])
+    monitor = _run_capturing_monitor(env, monkeypatch)
+    assert not monitor.marker_wired
+    assert monitor.turn_boundary is None
+
+
+@pytest.mark.parametrize("call_id", [None, "", 123])
+def test_codex_primary_boundary_malformed_call_identity_holds(tmp_path, call_id):
+    path = tmp_path / "rollout.jsonl"
+    probe = runner.CodexTurnBoundary()
+    _codex_lifecycle(path, "task_started", mode="w")
+    with path.open("a") as stream:
+        stream.write(json.dumps({"type": "response_item", "payload": {
+            "type": "custom_tool_call", "call_id": call_id,
+        }}) + "\n")
+    _codex_lifecycle(path, "task_complete")
+    assert not probe(path)
+
+
+@pytest.mark.parametrize("payload", [None, 1, [], "missing"])
+def test_codex_primary_boundary_malformed_payload_cannot_close_old_turn(tmp_path, payload):
+    path = tmp_path / "rollout.jsonl"
+    probe = runner.CodexTurnBoundary()
+    _codex_lifecycle(path, "task_started", mode="w")
+    record = {"type": "event_msg"}
+    if payload != "missing":
+        record["payload"] = payload
+    with path.open("a") as stream:
+        stream.write(json.dumps(record) + "\n")
+    _codex_lifecycle(path, "task_complete")
+    assert not probe(path)
+
+
+@pytest.mark.parametrize("record", [
+    {"type": "event_msg", "payload": {"type": "user_message", "message": "queued"}},
+    {"type": "response_item", "payload": {"type": "message", "role": "user"}},
+    {"type": "event_msg", "payload": {"type": "future_lifecycle"}},
+    {"type": "future_record", "payload": {}},
+    {"type": "event_msg", "payload": {}},
+    {"type": "response_item", "payload": {}},
+])
+def test_codex_primary_boundary_queued_or_unknown_record_invalidates_terminal(tmp_path, record):
+    path = tmp_path / "rollout.jsonl"
+    probe = runner.CodexTurnBoundary()
+    _codex_lifecycle(path, "task_started", mode="w")
+    _codex_lifecycle(path, "task_complete")
+    assert probe(path)
+    with path.open("a") as stream:
+        stream.write(json.dumps(record) + "\n")
+    assert not probe(path)
+    _codex_lifecycle(path, "task_complete")
+    assert not probe(path)
+    _codex_lifecycle(path, "task_started", turn_id="next")
+    _codex_lifecycle(path, "task_complete", turn_id="next")
+    assert probe(path)

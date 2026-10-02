@@ -1184,3 +1184,44 @@ def test_malformed_recorded_profile_cannot_fall_back_to_a_different_default(tmp_
     with pytest.raises(RuntimeError, match='recorded permission profile'):
         codex_mod.policy_after_review(rollout, default_policy=lambda: {
             'approvalPolicy': 'never', 'permissions': ':danger-full-access'})
+
+@pytest.mark.parametrize("native_id", [None, "t"])
+@pytest.mark.parametrize("cancel", ["dismiss", "close"])
+def test_question_cancel_returns_interrupted_and_preserves_fresh_id(env, monkeypatch, native_id, cancel):
+    from tandem.chat.events import QuestionCancelled
+    from tandem.chat.window import WindowAnswers
+
+    monkeypatch.setenv("FAKE_CODEX_SCENARIO", "question")
+    rec = Recorder()
+    children = []
+    spawn = env.runtime._spawn
+
+    def capture_process(*args, **kwargs):
+        child = spawn(*args, **kwargs)
+        children.append(child[0])
+        return child
+
+    monkeypatch.setattr(env.runtime, "_spawn", capture_process)
+    answers = WindowAnswers(lambda req: (
+        answers.cancel_question() if cancel == "dismiss" else answers.close()
+    ))
+    try:
+        outcome = env.runtime.run_turn(env.session, native_id, "ask", "", rec.emit, answers)
+    finally:
+        for child in children:
+            for pipe in (child.stdin, child.stdout, child.stderr):
+                if pipe is not None:
+                    pipe.close()
+
+    assert outcome.status == "interrupted" and outcome.error == ""
+    assert outcome.native_id == ("thread-new" if native_id is None else None)
+    assert env.runtime._proc is None
+    assert env.params("turn/interrupt") == {
+        "threadId": "thread-new" if native_id is None else "t", "turnId": "turn-1",
+    }
+    assert not (env.tmp / "reply.json").exists()
+    assert [e for e in rec.events if isinstance(e, TurnFinished)] == [TurnFinished("interrupted", "")]
+    assert not any(isinstance(e, Failure) for e in rec.events)
+    answers.close()
+    with pytest.raises(QuestionCancelled):
+        answers.answer(QuestionRequest("next?"))

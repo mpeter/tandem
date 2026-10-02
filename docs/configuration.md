@@ -29,6 +29,18 @@ sessions on a machine that also has opencode. Unknown names are
 dropped, duplicates deduped, and anything else malformed falls back to
 all three. Sessions already paired keep their own participant list.
 
+Retained OpenCode 1 pairs require explicit reconciliation on OpenCode 2.0.21:
+`tandem migrate-opencode <pair-id>` creates a verified fresh native identity and
+atomically updates the pair and its sync cursors. Original history remains
+available for recovery. `--dry-run` checks source shape without native conversion.
+
+The initial scope is closed, nonempty root histories. Completed checkpoints are
+supported when outgoing cursors have consumed the preceding archive; native
+summary and recent context remain active, and compacted tool outputs stay cleared.
+Pending work, unsupported attachments, parent/revert state, extra instructions
+and unverified loss refuse migration. Unreconciled retained identities and
+unrecognized sync positions remain refused rather than replayed.
+
 ## skip_permissions — no permission prompts in claude and codex
 
 A top-level switch, off by default. When on, every claude and codex
@@ -186,8 +198,8 @@ pins), `/skip-permissions [on|off]` (turn claude's and codex's permission
 prompts off or on from the next turn — see
 [`skip_permissions`](#skip_permissions--no-permission-prompts-in-claude-and-codex)),
 `/compact` (compact the default harness's conversation: claude runs its
-built-in, codex `thread/compact/start`, opencode `summarize` with the
-pinned model or the last reply's), `/model` (list the default
+built-in, codex `thread/compact/start`, OpenCode 1 `summarize`, or OpenCode 2
+`compact` with the selected model), `/model` (list the default
 harness's models; `/model NAME` is `/harness:NAME`) and `/mode
 [ask|edits|plan|skip]` (the permission mode from the next turn; `/mode`
 alone prints it, `/skip-permissions on|off` is `/mode skip|ask`). `ask` is

@@ -555,3 +555,22 @@ def test_run_turn_hands_review_to_argv(env, monkeypatch):
     argv = json.loads((env.tmp / "argv.json").read_text())
     assert "--json-schema" in argv and "--fork-session" not in argv and "--allowedTools" in argv
     assert out.status == "completed" and out.structured is not None
+
+
+@pytest.mark.parametrize("cancel", ["dismiss", "close"])
+def test_question_cancel_returns_interrupted_after_cleanup(env, monkeypatch, cancel):
+    from tandem.chat.events import Failure
+    from tandem.chat.window import WindowAnswers
+
+    monkeypatch.setenv("FAKE_CLAUDE_SCENARIO", "question")
+    rec = Recorder()
+    answers = WindowAnswers(lambda req: (
+        answers.cancel_question() if cancel == "dismiss" else answers.close()
+    ))
+    outcome = env.runtime.run_turn(env.session, "sid-1", "ask", "", rec.emit, answers)
+
+    assert outcome.status == "interrupted" and outcome.error == ""
+    assert env.runtime._proc is None
+    assert not (env.tmp / "reply.json").exists()
+    assert [e for e in rec.events if isinstance(e, TurnFinished)] == [TurnFinished("interrupted", "")]
+    assert not any(isinstance(e, Failure) for e in rec.events)

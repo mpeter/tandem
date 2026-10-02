@@ -15,6 +15,7 @@ from pathlib import Path
 from typing import Any
 
 from ..events import AssistantMessage, NormalizedEvent, SessionContext, SystemEvent, Thinking, ToolCall, ToolResult, UserMessage
+from ..opencode_binding import validate_pair_prefix, validate_prefix
 from . import opencode as v1
 from .base import ShadowBusy
 
@@ -52,9 +53,15 @@ def _table_exists(conn, table):
 
 
 def require_fresh_session(conn, sid):
+    if not conn.in_transaction:
+        conn.execute("BEGIN")
     if not _table_exists(conn, "session"):
+        if _table_exists(conn, "session_v2") and conn.execute("SELECT 1 FROM session_v2 WHERE id=?", (sid,)).fetchone():
+            validate_prefix(conn, sid)
         return
     if conn.execute("SELECT 1 FROM session WHERE id=?", (sid,)).fetchone() is None:
+        if _table_exists(conn, "session_v2") and conn.execute("SELECT 1 FROM session_v2 WHERE id=?", (sid,)).fetchone():
+            validate_prefix(conn, sid)
         return
     phase = "missing"
     if _table_exists(conn, "kv"):
@@ -78,7 +85,7 @@ def cursor_sequence(cursor):
     if pos is None or pos == {}:
         if cursor.line_index == 0 and getattr(cursor, "byte_offset", 0) == 0:
             return -1
-    elif isinstance(pos, dict) and set(pos) == {"seq"}:
+    elif isinstance(pos, dict) and set(pos) in ({"seq"}, {"seq", "binding"}):
         seq = pos["seq"]
         if isinstance(seq, int) and not isinstance(seq, bool) and seq >= -1:
             return seq
@@ -105,6 +112,7 @@ def _settled(message):
 
 def _busy(conn, sid):
     require_fresh_session(conn, sid)
+    proof = validate_prefix(conn, sid)
     row = conn.execute("SELECT time_suspended, time_compacting FROM session_v2 WHERE id=?", (sid,)).fetchone()
     if row is None:
         raise ValueError(f"session {sid} is not in session_v2; retained OpenCode 1 sessions are unsupported in this build")
@@ -120,6 +128,9 @@ def _busy(conn, sid):
     ).fetchone():
         return True
     last = conn.execute("SELECT type FROM session_message WHERE session_id=? AND type NOT IN ('agent-switched','model-switched','location-switched') ORDER BY seq DESC LIMIT 1", (sid,)).fetchone()
+    maximum = conn.execute("SELECT max(seq) FROM session_message WHERE session_id=?", (sid,)).fetchone()[0]
+    if proof and maximum <= proof["prefix_end"]:
+        return False
     return last is not None and last["type"] != "idle"
 
 
@@ -134,8 +145,9 @@ class _Opencode2UsageMeter(v1._OpencodeUsageMeter):
 
 
 class Opencode2TurnReader:
-    def __init__(self, session_id, db, cursor):
+    def __init__(self, session_id, db, cursor, session=None):
         self.session_id, self.db, self.cursor = session_id, db, cursor
+        self.session = session
 
     def poll(self):
         from ..tailer import TailedLine
@@ -143,8 +155,33 @@ class Opencode2TurnReader:
         after = cursor_sequence(self.cursor)
         out, turn = [], []
         with database(self.db) as conn:
+            conn.execute("BEGIN")
             require_fresh_session(conn, self.session_id)
-            for message in _messages(conn, self.session_id, after):
+            proof = (validate_pair_prefix(conn, self.session) if self.session is not None
+                     else validate_prefix(conn, self.session_id))
+            remaining = _messages(conn, self.session_id, after)
+            offset = 0
+            if proof:
+                maximum = conn.execute("SELECT max(seq) FROM session_message WHERE session_id=?", (self.session_id,)).fetchone()[0]
+                if maximum is None or after > maximum:
+                    raise ValueError("OpenCode cursor exceeds native history")
+                if after <= proof["prefix_end"] and after not in {0, *(unit["seq"] for unit in proof["units"])}:
+                    raise ValueError("OpenCode historical cursor does not match a unit boundary")
+                if self.cursor.pending.get("source_pos", {}).get("binding") != proof["binding_id"]:
+                    raise ValueError("OpenCode historical cursor is not bound to this reconciliation")
+                for unit in proof["units"]:
+                    if unit["seq"] <= after:
+                        continue
+                    start = offset
+                    while offset < len(remaining) and remaining[offset]["_seq"] <= unit["seq"]:
+                        offset += 1
+                    messages = remaining[start:offset]
+                    out.append(TailedLine(line_index=self.cursor.line_index + len(out), end_offset=0,
+                                          raw={"messages": messages, "_reconciliation_echo": unit["echo"]},
+                                          text=f"opencode historical turn {self.cursor.line_index + len(out)}",
+                                          pos={"seq": unit["seq"], "binding": proof["binding_id"]}))
+                    after = unit["seq"]
+            for message in remaining[offset:]:
                 turn.append(message)
                 if message["type"] != "idle":
                     continue
@@ -153,7 +190,7 @@ class Opencode2TurnReader:
                 index = self.cursor.line_index + len(out)
                 out.append(TailedLine(line_index=index, end_offset=0,
                                       raw={"messages": turn}, text=f"opencode turn {index}",
-                                      pos={"seq": message["_seq"]}))
+                                      pos={"seq": message["_seq"], **({"binding": proof["binding_id"]} if proof else {})}))
                 turn = []
         return out
 
@@ -190,6 +227,13 @@ class Opencode2Adapter(v1.OpencodeAdapter):
                 raise ValueError("OpenCode database unavailable; cannot verify the paired native session")
             with database(db) as conn:
                 require_fresh_session(conn, sid)
+                proof = validate_pair_prefix(conn, session)
+                for cursor in cursors:
+                    pos = cursor.pending.get("source_pos") or {}
+                    if proof and pos.get("binding") != proof["binding_id"]:
+                        raise ValueError("OpenCode source cursor is not bound to the committed reconciliation")
+                    if not proof and "binding" in pos:
+                        raise ValueError("OpenCode source cursor proof is missing")
 
     def transcript_path(self, cwd, session_id):
         db = db_path()
@@ -221,7 +265,8 @@ class Opencode2Adapter(v1.OpencodeAdapter):
         sid = session.native_id(self.id)
         with database(transcript) as conn:
             require_fresh_session(conn, sid)
-        return Opencode2TurnReader(sid, transcript, cursor)
+            validate_pair_prefix(conn, session)
+        return Opencode2TurnReader(sid, transcript, cursor, session)
 
     def fast_forward_cursor(self, session, cursor):
         cursor_sequence(cursor)
@@ -231,7 +276,9 @@ class Opencode2Adapter(v1.OpencodeAdapter):
         with database(db) as conn:
             require_fresh_session(conn, sid)
             seq = conn.execute("SELECT max(seq) FROM session_message WHERE session_id=?", (sid,)).fetchone()[0]
-        cursor.pending["source_pos"] = {"seq": seq if seq is not None else -1}
+            proof = validate_pair_prefix(conn, session)
+        cursor.pending["source_pos"] = {"seq": seq if seq is not None else -1,
+                                       **({"binding": proof["binding_id"]} if proof else {})}
 
     def pending_units(self, session, cursor):
         after = cursor_sequence(cursor)
@@ -240,6 +287,7 @@ class Opencode2Adapter(v1.OpencodeAdapter):
             return 0
         with database(db) as conn:
             require_fresh_session(conn, sid)
+            validate_pair_prefix(conn, session)
             return conn.execute("SELECT count(*) FROM session_message WHERE session_id=? AND seq>?", (sid, after)).fetchone()[0]
 
     def session_status(self, session_id):
@@ -255,6 +303,8 @@ class Opencode2Adapter(v1.OpencodeAdapter):
             return None
 
     def parse_entry(self, raw: dict[str, Any], ctx: SessionContext):
+        if raw.get("_reconciliation_echo"):
+            return [SystemEvent(source=self.id, subtype="tandem_echo")]
         messages = raw.get("messages")
         if not isinstance(messages, list):
             return [SystemEvent(source=self.id, subtype="opencode:unknown")]

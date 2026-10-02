@@ -81,14 +81,38 @@ silence never ends a running tool call or approval wait. If completion cannot be
 confirmed, cancel the switch or exit the native harness manually.
 
 OpenCode has separate adapters for **1.18+** and **2.0.21+**. OpenCode 2 uses
-its native session import and settled transcript format. Newer major versions
-remain excluded until verified. Its native interface supports fresh pairs;
-chat requires the OpenCode 2 chat runtime, which is not yet enabled.
+its native session import, settled transcript format, authenticated HTTP API,
+and execution events. Fresh pairs support both the native interface and chat.
+Newer major versions remain excluded until verified.
 
-Retained OpenCode 1 sessions remain unsupported even after native migration
-completes: their converted history and sync cursors need verified reconciliation.
-Start a fresh pair to use OpenCode 2. Retained rows and existing pair membership
-stay intact.
+Chat command discovery depends on the activation barrier in OpenCode 2.0.21's
+authenticated `GET /api/integration` handler (source revision
+`8a8bd622a3d7dc29ccf30ec17f84e363ed95ed72`). Tandem waits for that handler before
+reading the command catalog each turn. If the barrier fails, the turn is refused
+before input admission; an unknown slash command is sent literally only after
+the catalog settles.
+
+Retained OpenCode 1 pairs can be migrated explicitly with OpenCode **2.0.21**:
+
+```bash
+tandem migrate-opencode <pair-id> --dry-run  # source preflight; no native conversion
+tandem migrate-opencode <pair-id>
+```
+
+Migration uses native conversion, fork and import to create a fresh identity,
+verifies the imported history, then atomically translates every affected sync
+cursor and updates the pair. The original identity and legacy rows remain for
+recovery. Retries reuse the exact prepared identity; changed history, cursors or
+conflicting imports refuse adoption and preserve the unbound import.
+
+The initial scope is closed, nonempty root histories. Pending work, parent or
+revert state, extra instructions and unsupported attachments refuse migration.
+Completed checkpoints preserve native summary and recent context. Outgoing
+cursors must already have consumed archival context preceding the latest
+checkpoint; migration refuses otherwise, so superseded context cannot re-enter
+peers. Native compacted tool results retain the explicit cleared-result marker,
+while the original output remains in legacy storage. A dry run checks source
+shape only; native conversion and cursor cuts are verified during migration.
 
 ## What's new in 0.5
 

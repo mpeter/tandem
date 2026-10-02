@@ -31,7 +31,7 @@ from .commands import Command, catalog, help_lines
 from .composer import Answer, Cancel, Composer, CtrlC, Interrupt, Repaint, Submit
 from .dispatch import Dispatcher
 from .events import (ApprovalRequest, Failure, FileDiff, Idle, LimitsUpdate, LiveEvent, Notice,
-                     QuestionRequest, ReviewFinished, ReviewStarted, TextDelta, ThinkingDelta,
+                     QuestionCancelled, QuestionRequest, ReviewFinished, ReviewStarted, TextDelta, ThinkingDelta,
                      ToolFinished, ToolOutput, ToolStarted, TurnFinished, TurnStarted)
 from .files import list_paths
 from .navigator import Navigator, NavigatorLog, headroom_ok, log_path
@@ -59,6 +59,7 @@ def window_command(text: str) -> str:
     return head[0] if head and head[0] in WINDOW_COMMANDS else ""
 
 
+_QUESTION_CANCELLED = object()
 _CLOSED = object()      # what close() leaves in the answers queue for whoever is waiting
 
 
@@ -72,23 +73,32 @@ class WindowAnswers:
         return self._ask(req, "deny")
 
     def answer(self, req: QuestionRequest) -> str:
-        return self._ask(req, "")
+        return self._ask(req, _QUESTION_CANCELLED)
 
-    def _ask(self, req, fallback: str) -> str:
+    def _ask(self, req, fallback) -> str:
         """Put the request on screen and wait for the key. After close()
-        nobody is at the keyboard: the request waiting now gets the fallback,
-        and every later one is answered at once without reaching the screen —
+        nobody is at the keyboard: approvals are denied and questions are
+        cancelled, including later requests that never reach the screen —
         a runtime that asks its questions one after another (claude's
         AskUserQuestion) would otherwise park the worker on the second."""
         if self._closed:
+            if fallback is _QUESTION_CANCELLED:
+                raise QuestionCancelled("question cancelled")
             return fallback
         self._drop_stale()
         self._post(req)
         got = self._q.get()
-        return fallback if got is _CLOSED else got
+        if got is _CLOSED:
+            got = fallback
+        if got is _QUESTION_CANCELLED:
+            raise QuestionCancelled("question cancelled")
+        return got
 
     def resolve(self, text: str) -> None:
         self._q.put(text)
+
+    def cancel_question(self) -> None:
+        self._q.put(_QUESTION_CANCELLED)
 
     def close(self) -> None:
         self._closed = True
@@ -406,8 +416,12 @@ class Window:
         prompt queued behind it. Deny first, then interrupt."""
         if self.composer.mode not in ("approval", "question"):
             return False                          # prompt or search: nothing is pending
+        question = self.composer.mode == "question"
         self.composer.end_answer()
-        self.answers.resolve("deny")
+        if question:
+            self.answers.cancel_question()
+        else:
+            self.answers.resolve("deny")
         self.activity.answered()
         return True
 

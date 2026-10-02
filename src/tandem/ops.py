@@ -488,8 +488,8 @@ def run_sub(
     stdin and never touches argv.
 
     quiet=True is the bridge-agent mode: codex's raw transcript goes to a log
-    file and this command's ENTIRE stdout becomes the worker's final message
-    (via codex's own `-o/--output-last-message`). With inherited stdio the
+    file and stdout carries the worker's final message
+    (via codex's own `-o/--output-last-message`) plus a dispatch receipt. With inherited stdio the
     caller would instead get the whole exec log — header, actions, token
     counts — and asking a cheap relay model to extract "the final message"
     from that is unreliable. quiet=False is byte-for-byte unchanged: stdio is
@@ -504,7 +504,8 @@ def run_sub(
         # exec-level flag: must precede the `resume` subcommand, like -m.
         # Value is caller-validated ("read-only"/"workspace-write"); the
         # brief can never influence it (stdin-only transport).
-        argv += ["--sandbox", sandbox]
+        permission = ":read-only" if sandbox == "read-only" else ":workspace"
+        argv += ["--sandbox", sandbox, "-c", f'default_permissions="{permission}"']
     if context == "full":
         with _sub_lock():
             sub_id, sub_path = fork_shadow(store, session)
@@ -573,6 +574,11 @@ def run_sub(
             shutil.move(sub_path, sub_root / sub_path.name)
         else:
             sub_path.unlink(missing_ok=True)
+    if quiet:
+        from .relayguard import receipt
+
+        sys.stdout.write("\n" + receipt(sub_id, model, code, task) + "\n")
+        sys.stdout.flush()
     return code
 
 

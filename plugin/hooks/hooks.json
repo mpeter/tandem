@@ -4,7 +4,41 @@
       {
         "matcher": "Agent|Task",
         "hooks": [
-          {"type": "command", "command": "tandem hook-route || true"}
+          {
+            "type": "command",
+            "command": "tandem hook-route || true"
+          }
+        ]
+      },
+      {
+        "matcher": "*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/hooks/relay-scope.py\" pre || exit 2"
+          }
+        ]
+      }
+    ],
+    "SubagentStop": [
+      {
+        "matcher": "^tandem:(gpt|codex-worker)$",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/hooks/relay-scope.py\" stop || exit 2"
+          }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": "Agent|Task",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/hooks/relay-scope.py\" post || exit 2"
+          }
         ]
       }
     ]

@@ -209,6 +209,9 @@ closes. Every other leading `/word` goes to the current harness as its own
 slash command; for opencode a listed command runs through its command
 endpoint, as its TUI would.
 
+Codex context percentages use the latest model call, while token totals remain
+cumulative.
+
 Prompts you submit are kept per directory, across windows, in tandem's
 own state store (`~/.tandem/state.db`, in plain text like the CLIs' own
 history files; the newest 500; approval keys and question answers are

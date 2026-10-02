@@ -31,7 +31,7 @@ RELAY_NAMES = frozenset({BRIDGE_NAME, ALIAS_NAME})
 # Write-consent propagation: these are the two claude permission modes in
 # which the user has already said "apply edits without asking". Every other
 # value — default, plan, and any mode added after this list was written —
-# maps to "" (codex keeps its configured default, read-only in practice):
+# maps to explicit read-only; the configured default can permit writes:
 # an unrecognized mode is not consent.
 WRITE_MODES = frozenset({"acceptEdits", "bypassPermissions"})
 
@@ -74,8 +74,8 @@ def relay_pin(payload: dict) -> tuple[str, str] | None:
 
 def sandbox_for_mode(permission_mode) -> str:
     """The codex --sandbox value a dispatch from this claude permission
-    mode has consented to, or "" for 'pass no flag'."""
-    return "workspace-write" if permission_mode in WRITE_MODES else ""
+    mode has consented to; unknown modes grant no writes."""
+    return "workspace-write" if permission_mode in WRITE_MODES else "read-only"
 
 
 # The plugin is installed globally in claude, so its silence is ambiguous:

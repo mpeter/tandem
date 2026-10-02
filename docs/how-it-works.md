@@ -144,6 +144,11 @@ tandem pins what it was built against (observed formats documented in
 | OpenCode 1 | 1.18.20 | ≥ 1.18, < 2 |
 | OpenCode 2 | 2.0.21 | ≥ 2.0.21, < 3 |
 
+These ranges cover session-format compatibility. Codex profile-dependent chat
+modes and reviews additionally require the experimental permission-profile APIs
+described in [configuration](configuration.md#chat--the-unified-window). Their earliest supporting
+CLI version has not been established; API availability was checked on 0.159.3.
+
 Above a range's ceiling, tandem warns and asks you to run `tandem doctor`
 before trusting sync, unless the version is known incompatible and excluded.
 Below a floor, the harness is excluded. OpenCode 2 versions before 2.0.21 and

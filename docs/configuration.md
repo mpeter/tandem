@@ -224,6 +224,21 @@ endpoint, as its TUI would.
 Codex context percentages use the latest model call, while token totals remain
 cumulative.
 
+Codex chat selects named permission profiles (`:read-only`, `:workspace`, or
+`:danger-full-access`) and verifies the effective profile, sandbox, and approval
+policy before starting a turn. A server that cannot supply or apply the requested
+profile fails the turn before running the model. Explicit settings keep precedence
+over mode presets; reviews use read-only and restore the preceding effective
+policy afterward.
+
+These profile-dependent chat modes and reviews require the experimental
+`permissionProfile/list` API, named `permissions` selection, and effective policy
+readback from `thread/start` or `thread/resume`. API availability and protocol
+fields were checked with Codex 0.159.3; the general CLI compatibility range does
+not establish support for these APIs in older servers. Servers without the
+required API fail the requested turn before `turn/start` rather than falling
+back to legacy sandbox selection.
+
 Prompts you submit are kept per directory, across windows, in tandem's
 own state store (`~/.tandem/state.db`, in plain text like the CLIs' own
 history files; the newest 500; approval keys and question answers are

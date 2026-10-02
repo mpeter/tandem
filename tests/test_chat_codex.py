@@ -218,6 +218,7 @@ def test_child_death_during_approval_returns_an_outcome(env):
     class KillsTheChild(Recorder):
         def approve(self, req):
             proc = rt._proc                     # deliberate: stands in for an external kill
+            self.proc = proc                    # retain the pipe so the check does not depend on GC
             os.killpg(proc.pid, signal.SIGKILL)
             proc.wait(timeout=5)                # dead read end, so the write is deterministic
             return super().approve(req)
@@ -226,6 +227,7 @@ def test_child_death_during_approval_returns_an_outcome(env):
     out = rt.run_turn(env.session, "t", "make x", "", rec.emit, rec)
     assert out.status == "failed"
     assert isinstance(rec.events[-1], TurnFinished)
+    assert rec.proc.stdin.closed                # no buffered write left to fail during finalization
 
 
 def test_interrupt(env, monkeypatch):

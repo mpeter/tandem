@@ -310,7 +310,12 @@ class CodexRuntime:
                     proc.stdin.write(json.dumps(obj) + "\n")
                     proc.stdin.flush()
                 except (OSError, ValueError):
-                    pass
+                    # Close even if flushing fails again, so finalization cannot
+                    # retry the buffered write to the dead child.
+                    try:
+                        proc.stdin.close()
+                    except (OSError, ValueError):
+                        pass
 
     def _request(self, proc, method: str, params: dict | None) -> int:
         self._n += 1
